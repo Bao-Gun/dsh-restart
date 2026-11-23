@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { describe, expect, it } from 'vitest'
 
 import {
+  Config,
   PRECHECK_PATH,
   RESTART_PATH,
   STATUS_PATH,
@@ -29,12 +30,17 @@ interface FakeRes {
   flushHeaders(): void
   write(chunk: string): boolean
   end(chunk?: string): void
-  once(event: 'finish', listener: () => void): void
+  once(event: 'finish' | 'close', listener: () => void): void
+  emit(event: 'finish' | 'close'): void
 }
 
-/** 假响应：只记录写出去的东西，不碰 socket。end() 同步触发 finish，等价于真实响应的「已冲刷」。 */
-function makeRes(): FakeRes {
-  const listeners: Array<() => void> = []
+/**
+ * 假响应：只记录写出去的东西，不碰 socket。
+ * end() 同步触发 finish 再触发 close，等价于真实响应「已冲刷并关闭」。
+ * emit('close') 用来模拟客户端在流中途断开。listener 按 once 语义只留到第一次 emit。
+ */
+function makeRes(options: { suppressFinish?: boolean } = {}): FakeRes {
+  const listeners: Record<'finish' | 'close', Array<() => void>> = { finish: [], close: [] }
   const res: FakeRes = {
     statusCode: 200,
     headersSent: false,
@@ -55,10 +61,16 @@ function makeRes(): FakeRes {
       if (chunk !== undefined) res.chunks.push(String(chunk))
       res.headersSent = true
       res.writableEnded = true
-      for (const listener of listeners) listener()
+      if (options.suppressFinish !== true) res.emit('finish')
+      res.emit('close')
     },
-    once(_event, listener) {
-      listeners.push(listener)
+    once(event, listener) {
+      listeners[event].push(listener)
+    },
+    emit(event) {
+      const pending = listeners[event]
+      listeners[event] = []
+      for (const listener of pending) listener()
     },
   }
   return res
@@ -70,7 +82,7 @@ function makeReq(
   return {
     method: options.method ?? 'GET',
     headers: { host: '127.0.0.1:3080', 'x-dsh-restart': '1', ...options.headers },
-    url: options.url ?? '/',
+    url: options.url ?? STATUS_PATH,
     socket: { remoteAddress: options.remoteAddress ?? '127.0.0.1' },
   } as unknown as IncomingMessage
 }
@@ -213,6 +225,20 @@ describe('插件入口', () => {
     expect(fake.routes.get(STATUS_PATH)?.kind).toBe('exact')
     expect(fake.labels).toHaveLength(3)
   })
+
+  it('三条路径就是 Task 5 helper 写的字面量', () => {
+    expect(STATUS_PATH).toBe('/dsh-restart/api/status')
+    expect(PRECHECK_PATH).toBe('/dsh-restart/api/precheck')
+    expect(RESTART_PATH).toBe('/dsh-restart/api/restart')
+  })
+
+  it('Config 不吞配置：空对象/缺省通过，带任何字段都报 issue', () => {
+    const validate = Config['~standard'].validate
+    expect(validate(undefined)).toEqual({ value: {} })
+    expect(validate({})).toEqual({ value: {} })
+    const result = validate({ foo: 1 }) as { issues?: Array<{ message: string }> }
+    expect(result.issues?.[0]?.message).toContain('没有配置项')
+  })
 })
 
 describe('请求门（路由层）', () => {
@@ -281,9 +307,19 @@ describe('GET /dsh-restart/api/status', () => {
       stale: false,
       fingerprint: FP,
       restarting: true,
+      logDir: io.logDir,
+      profileName: PROFILE.name,
       last: record,
     })
     expect(probes).toEqual([3080])
+  })
+
+  it('last.json 不存在也返回 200：顶层显式 null，last 为空对象', async () => {
+    const fake = makeCtx({ profile: PROFILE, omitPort: true })
+    const { io } = makeIo({ readLast: async () => ({}) })
+    const res = await call(createHandlers(fake.ctx, io).status, makeReq({ method: 'GET' }), makeRes())
+    expect(res.statusCode).toBe(200)
+    expect(json(res)).toMatchObject({ ok: true, port: null, stale: true, last: {} })
   })
 
   it('指纹对不上时 stale=true', async () => {
@@ -336,6 +372,60 @@ describe('GET /dsh-restart/api/status', () => {
     )
     expect(res.statusCode).toBe(401)
   })
+
+  it('带代理转发头或 Host 不是回环时不享受 401 例外', async () => {
+    const fake = makeCtx({ profile: PROFILE, rejection: 401 })
+    const { io } = makeIo()
+    const handlers = createHandlers(fake.ctx, io)
+    const forwarded = await call(
+      handlers.status,
+      makeReq({ method: 'GET', headers: { 'x-forwarded-for': '203.0.113.9' } }),
+      makeRes(),
+    )
+    expect(forwarded.statusCode).toBe(401)
+    const publicHost = await call(
+      handlers.status,
+      makeReq({ method: 'GET', headers: { host: 'dsh.example.com' } }),
+      makeRes(),
+    )
+    expect(publicHost.statusCode).toBe(401)
+  })
+
+  it('401 例外绑定 status 路径：同一 handler 收到别的 URL 仍 401', async () => {
+    const fake = makeCtx({ profile: PROFILE, rejection: 401 })
+    const { io } = makeIo()
+    const res = await call(
+      createHandlers(fake.ctx, io).status,
+      makeReq({ method: 'GET', url: '/dsh-restart/api/precheck' }),
+      makeRes(),
+    )
+    expect(res.statusCode).toBe(401)
+  })
+
+  it('precheck / restart 的 POST 不享受 401 例外，且没有副作用', async () => {
+    const fake = makeCtx({ profile: PROFILE, rejection: 401 })
+    let smokeCalls = 0
+    let writeCalls = 0
+    const scheduled: unknown[] = []
+    const { io } = makeIo({
+      runSmoke: async () => {
+        smokeCalls += 1
+        return smoke()
+      },
+      writeLast: async () => {
+        writeCalls += 1
+      },
+      scheduleRestart: (options) => scheduled.push(options),
+    })
+    const handlers = createHandlers(fake.ctx, io)
+    const precheckRes = await call(handlers.precheck, makeReq({ method: 'POST' }), makeRes())
+    const restartRes = await call(handlers.restart, makeReq({ method: 'POST' }), makeRes())
+    expect(precheckRes.statusCode).toBe(401)
+    expect(restartRes.statusCode).toBe(401)
+    expect(smokeCalls).toBe(0)
+    expect(writeCalls).toBe(0)
+    expect(scheduled).toHaveLength(0)
+  })
 })
 
 describe('POST /dsh-restart/api/precheck', () => {
@@ -349,7 +439,7 @@ describe('POST /dsh-restart/api/precheck', () => {
     expect(res.headers['content-type']).toContain('application/x-ndjson')
     const lines = ndjson(res)
     expect(lines.slice(0, 3).map((line) => line.stage)).toEqual(['config', 'compat', 'boot'])
-    expect(lines.at(-1)).toEqual({ done: true })
+    expect(lines.at(-1)).toMatchObject({ done: true, ok: true, saved: true, fingerprint: FP })
     for (const line of lines.slice(0, 3)) {
       expect(line).toMatchObject({ ok: true, failures: [] })
     }
@@ -369,6 +459,87 @@ describe('POST /dsh-restart/api/precheck', () => {
     expect(linesSeenWhenSmokeStarts).toBe(2)
   })
 
+  it('冒烟跑完才发现客户端断开：阶段结论不落盘', async () => {
+    const fake = makeCtx({ profile: PROFILE })
+    let res: FakeRes | undefined
+    let writeCalls = 0
+    const { io } = makeIo({
+      runSmoke: async () => {
+        res?.emit('close')
+        return smoke({ failedEntries: ['new'] })
+      },
+      writeLast: async () => {
+        writeCalls += 1
+      },
+    })
+    res = makeRes()
+    await call(createHandlers(fake.ctx, io).precheck, makeReq({ method: 'POST' }), res)
+    expect(writeCalls).toBe(0)
+    const lines = ndjson(res)
+    expect(lines.find((line) => line.stage === 'boot')).toMatchObject({ cancelled: true, ok: false })
+    expect(lines.at(-1)).toMatchObject({ done: true, saved: false, cancelled: true })
+  })
+
+  it('已有一轮预检时第二次直接 409，不排队也不重复跑', async () => {
+    const fake = makeCtx({ profile: PROFILE })
+    let releaseConfig: (value: Failure[]) => void = () => {}
+    const configGate = new Promise<Failure[]>((resolve) => {
+      releaseConfig = resolve
+    })
+    let configCalls = 0
+    const { io } = makeIo({
+      runDumpConfig: async () => {
+        configCalls += 1
+        return configGate
+      },
+    })
+    const handlers = createHandlers(fake.ctx, io)
+    const first = call(handlers.precheck, makeReq({ method: 'POST' }), makeRes())
+    const secondRes = await call(handlers.precheck, makeReq({ method: 'POST' }), makeRes())
+    expect(secondRes.statusCode).toBe(409)
+    expect(secondRes.headers['content-type']).toContain('application/json')
+    expect(configCalls).toBe(1)
+    releaseConfig([])
+    await first
+  })
+
+  it('客户端在快检阶段断开：不跑冒烟、不写盘，流里标记 cancelled 并释放互斥', async () => {
+    const fake = makeCtx({ profile: PROFILE })
+    let firstRes: FakeRes | undefined
+    let smokeCalls = 0
+    let writeCalls = 0
+    const { io } = makeIo({
+      runDumpConfig: async () => {
+        firstRes?.emit('close')
+        return []
+      },
+      runSmoke: async () => {
+        smokeCalls += 1
+        return smoke()
+      },
+      writeLast: async () => {
+        writeCalls += 1
+      },
+    })
+    const handlers = createHandlers(fake.ctx, io)
+    firstRes = makeRes()
+    const first = await call(handlers.precheck, makeReq({ method: 'POST' }), firstRes)
+    expect(smokeCalls).toBe(0)
+    expect(writeCalls).toBe(0)
+    expect(ndjson(first).at(-1)).toMatchObject({
+      done: true,
+      ok: false,
+      saved: false,
+      cancelled: true,
+      reason: 'cancelled',
+    })
+
+    // 取消后 finally 必须释放锁，下一轮还能正常跑。
+    const second = await call(handlers.precheck, makeReq({ method: 'POST' }), makeRes())
+    expect(second.statusCode).toBe(200)
+    expect(ndjson(second).at(-1)).toMatchObject({ done: true, ok: true, saved: true })
+  })
+
   it('通过时写入 precheck + baseline + 指纹；三行都 ok', async () => {
     const fake = makeCtx({ profile: PROFILE })
     const writes: Array<Partial<LastRecord>> = []
@@ -380,7 +551,7 @@ describe('POST /dsh-restart/api/precheck', () => {
       },
     })
     const res = await call(createHandlers(fake.ctx, io).precheck, makeReq({ method: 'POST' }), makeRes())
-    expect(ndjson(res).at(-1)).toEqual({ done: true })
+    expect(ndjson(res).at(-1)).toMatchObject({ done: true, ok: true, saved: true, fingerprint: FP })
     expect(writes).toHaveLength(1)
     expect(writes[0]).toMatchObject({
       fingerprint: FP,
@@ -408,6 +579,8 @@ describe('POST /dsh-restart/api/precheck', () => {
     expect(writes[0]?.baseline).toBeUndefined()
     expect(writes[0]?.precheck).toMatchObject({ ok: false })
     expect(writes[0]?.precheck?.failures.some((failure) => failure.plugin === 'new')).toBe(true)
+    // 未通过也同步指纹，只是基线不动（Task 2 的不变量）。
+    expect(writes[0]?.fingerprint).toBe(FP)
   })
 
   it('快检失败后仍继续跑后面的阶段', async () => {
@@ -438,7 +611,7 @@ describe('POST /dsh-restart/api/precheck', () => {
     expect(lines[0]).toMatchObject({ stage: 'config', ok: false })
     expect(String((lines[0]?.failures as Failure[])[0]?.message)).toContain('spawn ENOENT')
     expect(lines[2]).toMatchObject({ stage: 'boot', ok: false })
-    expect(lines.at(-1)).toEqual({ done: true })
+    expect(lines.at(-1)).toMatchObject({ done: true, ok: false, saved: true, fingerprint: FP })
   })
 
   it('指纹为 null 时不写 last.json', async () => {
@@ -451,7 +624,12 @@ describe('POST /dsh-restart/api/precheck', () => {
       },
     })
     const res = await call(createHandlers(fake.ctx, io).precheck, makeReq({ method: 'POST' }), makeRes())
-    expect(ndjson(res).at(-1)).toEqual({ done: true })
+    expect(ndjson(res).at(-1)).toMatchObject({
+      done: true,
+      ok: true,
+      saved: false,
+      reason: 'fingerprint-unavailable',
+    })
     expect(wrote).toBe(false)
   })
 
@@ -481,12 +659,54 @@ describe('POST /dsh-restart/api/restart', () => {
     await call(createHandlers(fake.ctx, io).restart, makeReq({ method: 'POST' }), res)
 
     expect(res.statusCode).toBe(202)
-    expect(json(res)).toMatchObject({ ok: true, port: 3080 })
+    expect(json(res)).toMatchObject({
+      ok: true,
+      port: 3080,
+      logDir: io.logDir,
+      profileName: PROFILE.name,
+    })
     expect(res.chunks).toHaveLength(1)
     expect(endedWhenScheduled).toBe(true)
     expect(scheduled).toEqual([
       { port: 3080, profileDir: PROFILE.dir, logDir: io.logDir, dshHome: PROFILE.home, profileName: PROFILE.name },
     ])
+  })
+
+  it('客户端在 202 写完前断开（只有 close 没有 finish）也派生 helper', async () => {
+    const fake = makeCtx({ profile: PROFILE, port: 3080 })
+    const scheduled: unknown[] = []
+    const { io } = makeIo({ scheduleRestart: (options) => scheduled.push(options) })
+    const res = makeRes({ suppressFinish: true })
+    await call(createHandlers(fake.ctx, io).restart, makeReq({ method: 'POST' }), res)
+    expect(res.statusCode).toBe(202)
+    expect(scheduled).toHaveLength(1)
+  })
+
+  it('同一进程内双击：第二个 409，只派生一个 helper', async () => {
+    const fake = makeCtx({ profile: PROFILE, port: 3080 })
+    let releaseRefused: (value: boolean) => void = () => {}
+    const refusedGate = new Promise<boolean>((resolve) => {
+      releaseRefused = resolve
+    })
+    let refusedCalls = 0
+    const scheduled: unknown[] = []
+    const { io } = makeIo({
+      isRefused: async () => {
+        refusedCalls += 1
+        return refusedGate
+      },
+      scheduleRestart: (options) => scheduled.push(options),
+    })
+    const handlers = createHandlers(fake.ctx, io)
+    const firstRes = makeRes()
+    const first = call(handlers.restart, makeReq({ method: 'POST' }), firstRes)
+    const secondRes = await call(handlers.restart, makeReq({ method: 'POST' }), makeRes())
+    expect(secondRes.statusCode).toBe(409)
+    expect(refusedCalls).toBe(1)
+    releaseRefused(false)
+    await first
+    expect(firstRes.statusCode).toBe(202)
+    expect(scheduled).toHaveLength(1)
   })
 
   it('已有重启锁时 409，且不排重启', async () => {

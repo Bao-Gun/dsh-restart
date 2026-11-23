@@ -94,6 +94,9 @@ export const Config = {
       if (typeof value !== 'object' || Array.isArray(value)) {
         return { issues: [{ message: 'dsh-restart 没有配置项，但配置必须是对象' }] }
       }
+      if (Object.keys(value).length > 0) {
+        return { issues: [{ message: 'dsh-restart 没有配置项，不能带任何配置字段' }] }
+      }
       return { value: {} }
     },
   },
@@ -143,9 +146,13 @@ export function apply(ctx: RouteContext): void {
 
 export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = {}): Handlers {
   const io = withOverrides(defaultIo(), overrides)
+  // 进程内互斥：预检最贵的一段是克隆 profile 起实例，两个并行会互抢固定端口。
+  let precheckRunning = false
+  // 进程内重启互斥：挡住同一进程内同时点两次；跨进程仍以 helper 的 lock 文件为准。
+  let restartStarting = false
 
   const status: RouteHandler = async (req, res) => {
-    if (!guard(ctx, req, res, 'GET')) return
+    if (!guard(ctx, req, res, 'GET', STATUS_PATH)) return
     const profile = profileOf(ctx)
     if (profile === undefined) {
       respondJson(res, 503, { ok: false, error: '取不到 profileContext，无法判断当前 profile' })
@@ -162,6 +169,7 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
     ])
 
     // last.json 从未写过也返回 200：helper 拿它当「插件已加载」的第二段判据。
+    // 形状约定：顶层缺值显式给 null；last 内部的字段来自 last.json，缺就省略（可能是 {}）。
     respondJson(res, 200, {
       ok: true,
       at: io.now().toISOString(),
@@ -170,17 +178,32 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
       stale: isStale(record, fingerprint),
       fingerprint,
       restarting,
+      logDir: io.logDir,
+      profileName: profile.name,
       last: record,
     })
   }
 
   const precheck: RouteHandler = async (req, res) => {
-    if (!guard(ctx, req, res, 'POST')) return
+    if (!guard(ctx, req, res, 'POST', PRECHECK_PATH)) return
     const profile = profileOf(ctx)
     if (profile === undefined) {
       respondJson(res, 503, { ok: false, error: '取不到 profileContext，无法预检' })
       return
     }
+    if (precheckRunning) {
+      // 不排队：排队只会让用户等两轮克隆，第二轮还大概率看到同一份过期结论。
+      respondJson(res, 409, { ok: false, error: '已有一轮预检在进行，等它结束再试' })
+      return
+    }
+    precheckRunning = true
+
+    // 客户端断开就作废这轮结论；进程内没有中断冒烟的可靠办法，只能跑完再丢弃。
+    let cancelled = false
+    const markCancelled = (): void => {
+      if (!res.writableEnded) cancelled = true
+    }
+    res.once('close', markCancelled)
 
     res.statusCode = 200
     res.setHeader('content-type', 'application/x-ndjson; charset=utf-8')
@@ -195,11 +218,33 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
 
     const startedAt = Date.now()
     const write = (payload: unknown): void => {
+      // writableEnded 之外还要看 destroyed：客户端断开后底层 socket 已不在，
+      // 但 Node 允许 write() 不抛错，这里必须主动停，避免每阶段空写。
       if (res.writableEnded) return
+      if ((res as { destroyed?: boolean }).destroyed === true) return
       try {
         res.write(JSON.stringify(payload) + '\n')
       } catch (error) {
         console.error('[dsh-restart] NDJSON 写失败：' + messageOf(error))
+      }
+    }
+
+    // 取消时补一条 boot 行 + done 行：客户端至少知道这轮没结论，而不是连接莫名其妙断掉。
+    const cancelledPayload = (smokeResult?: SmokeResult): void => {
+      write({
+        stage: 'boot',
+        ok: false,
+        cancelled: true,
+        failures: smokeResult?.failures ?? [],
+        entries: smokeResult?.failedEntries ?? [],
+        added: [],
+        health: smokeResult?.health ?? false,
+      })
+      write({ done: true, ok: false, saved: false, cancelled: true, reason: 'cancelled' })
+      try {
+        res.end()
+      } catch {
+        // 客户端已经走了。
       }
     }
 
@@ -220,6 +265,11 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
       }
       write({ stage: 'compat', ok: compat.length === 0, failures: compat })
 
+      if (cancelled) {
+        cancelledPayload()
+        return
+      }
+
       // 快检 C：克隆 profile 真起一个实例，收未激活名单并跟基线差分。
       let smoke: SmokeResult
       try {
@@ -232,6 +282,11 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
           failedEntries: [],
           durationMs: 0,
         }
+      }
+      if (cancelled) {
+        // 冒烟已经跑完（没法中途杀），但这轮结论不写盘、也不当成通过。
+        cancelledPayload(smoke)
+        return
       }
       const previous = await safeReadLast(io, io.logDir)
       const { added } = diffFailedEntries(smoke.failedEntries, previous.baseline ?? [])
@@ -262,6 +317,11 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
         fingerprint = null
       }
 
+      if (cancelled) {
+        cancelledPayload(smoke)
+        return
+      }
+
       let saveError: string | undefined
       if (fingerprint !== null) {
         const result: PrecheckResult = {
@@ -272,7 +332,8 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
           durationMs: Math.max(0, Date.now() - startedAt),
         }
         try {
-          // 通过：记 precheck + 本次完整名单做基线；不通过：只记 precheck，基线不动。
+          // 通过：记 precheck + 本次完整名单做基线；不通过：也同步指纹（Task 2 的不变量），
+          // 但基线不动。这样 status 能分清「通过后 profile 又变了」和「上次就没过」。
           const patch: Partial<LastRecord> = ok
             ? { precheck: result, baseline: [...smoke.failedEntries].sort(), fingerprint }
             : { precheck: result, fingerprint }
@@ -282,12 +343,16 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
         }
       }
       // fingerprint 为 null：结果绑不到当前 profile，不写盘；status 会一直判过期。
+      // 因此 done 里必须带 saved:false，别让客户端把「阶段都绿了」当成可用的通过结论。
 
-      if (saveError === undefined) {
-        write({ done: true })
-      } else {
+      if (saveError !== undefined) {
         console.error('[dsh-restart] ' + saveError)
-        write({ done: true, error: saveError })
+        write({ done: true, ok: false, saved: false, error: saveError })
+      } else if (fingerprint === null) {
+        // 阶段结论本身是 ok，但没落盘：让客户端用 saved 区分，别只看 ok。
+        write({ done: true, ok, saved: false, reason: 'fingerprint-unavailable' })
+      } else {
+        write({ done: true, ok, saved: true, fingerprint })
       }
       try {
         res.end()
@@ -296,61 +361,101 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
       }
     } catch (error) {
       console.error('[dsh-restart] 预检异常终止：' + messageOf(error))
-      write({ done: true, error: '预检异常终止：' + messageOf(error) })
+      write({ done: true, ok: false, saved: false, error: '预检异常终止：' + messageOf(error) })
       try {
         res.end()
       } catch {
         // 同上。
       }
+    } finally {
+      // 409 那条分支在加锁前就返回了，这里只负责释放真正跑起来的那一轮。
+      precheckRunning = false
     }
   }
 
   const restart: RouteHandler = async (req, res) => {
-    if (!guard(ctx, req, res, 'POST')) return
-    const profile = profileOf(ctx)
-    if (profile === undefined) {
-      respondJson(res, 503, { ok: false, error: '取不到 profileContext，无法重启' })
-      return
-    }
-    const port = currentPort(ctx)
-    if (port === undefined) {
-      respondJson(res, 503, { ok: false, error: 'webServer 还没监听端口，无法重启' })
-      return
-    }
-    let refused = false
-    try {
-      refused = await io.isRefused(join(io.logDir, RESTART_LOCK_NAME))
-    } catch {
-      refused = false
-    }
-    if (refused) {
+    if (!guard(ctx, req, res, 'POST', RESTART_PATH)) return
+    if (restartStarting) {
+      // 进程内先挡一层，别让双击产生两个 helper；跨进程的最终裁决仍看 restart.lock。
       respondJson(res, 409, { ok: false, error: '已有一个重启在进行中，等它结束再试' })
       return
     }
-
-    const at = io.now().toISOString()
-    let armed = false
-    const arm = (): void => {
-      if (armed) return
-      armed = true
-      // 响应已落 socket 才派生 helper；不在响应前拍脑袋延迟。
-      io.scheduleRestart({
-        port,
-        profileDir: profile.dir,
-        logDir: io.logDir,
-        dshHome: profile.home,
-        profileName: profile.name,
-      })
+    restartStarting = true
+    let released = false
+    const release = (): void => {
+      if (released) return
+      released = true
+      restartStarting = false
     }
 
-    // 'finish' = 响应真正写完；没有它（测试替身）才退回到 end 之后立刻派。
-    const hasFinish = typeof res.once === 'function'
-    if (hasFinish) res.once('finish', arm)
-    res.statusCode = 202
-    res.setHeader('content-type', 'application/json; charset=utf-8')
-    res.setHeader('cache-control', 'no-store')
-    res.end(JSON.stringify({ ok: true, at, port }))
-    if (!hasFinish) arm()
+    try {
+      const profile = profileOf(ctx)
+      if (profile === undefined) {
+        release()
+        respondJson(res, 503, { ok: false, error: '取不到 profileContext，无法重启' })
+        return
+      }
+      const port = currentPort(ctx)
+      if (port === undefined) {
+        release()
+        respondJson(res, 503, { ok: false, error: 'webServer 还没监听端口，无法重启' })
+        return
+      }
+      let refused = false
+      try {
+        refused = await io.isRefused(join(io.logDir, RESTART_LOCK_NAME))
+      } catch {
+        refused = false
+      }
+      if (refused) {
+        release()
+        respondJson(res, 409, { ok: false, error: '已有一个重启在进行中，等它结束再试' })
+        return
+      }
+
+      const at = io.now().toISOString()
+      let armed = false
+      const arm = (): void => {
+        if (armed) return
+        armed = true
+        // 响应已落 socket 才派生 helper；不在响应前拍脑袋延迟。
+        io.scheduleRestart({
+          port,
+          profileDir: profile.dir,
+          logDir: io.logDir,
+          dshHome: profile.home,
+          profileName: profile.name,
+        })
+      }
+
+      // 'finish' 正常路径；'close' 兜底客户端在 202 落盘前就断开的情况。arm 幂等。
+      res.once('finish', arm)
+      res.once('close', arm)
+      res.once('close', release)
+      res.statusCode = 202
+      res.setHeader('content-type', 'application/json; charset=utf-8')
+      res.setHeader('cache-control', 'no-store')
+      res.end(
+        JSON.stringify({
+          ok: true,
+          at,
+          port,
+          logDir: io.logDir,
+          profileName: profile.name,
+        }),
+      )
+    } catch (error) {
+      release()
+      if (!res.headersSent) {
+        respondJson(res, 500, { ok: false, error: '重启请求处理失败：' + messageOf(error) })
+      } else {
+        try {
+          res.end()
+        } catch {
+          // 客户端先断了。
+        }
+      }
+    }
   }
 
   return { status, precheck, restart }
@@ -438,7 +543,11 @@ function isConnection(value: unknown): value is ConnectionLike {
   return isRecord(value) && typeof value.requestRejection === 'function'
 }
 
-/** undefined = 放行；数字 = 宿主给出的拒绝状态码；服务缺失时自己补一个 503。 */
+/**
+ * undefined = 放行；数字 = 宿主给出的拒绝状态码；服务缺失时自己补一个 503。
+ * 这里故意不用 403：403 代表「宿主明确拒绝」，503 代表「本插件取不到连接服务」，
+ * 两者在排障时含义不同（约束里写的 403 是「请求被拒」的兜底，不是服务未挂载）。
+ */
 function rejectionOf(ctx: RouteContext, req: IncomingMessage): number | undefined {
   const connection = connectionOf(ctx)
   if (connection === undefined) return 503
@@ -452,22 +561,55 @@ function rejectionOf(ctx: RouteContext, req: IncomingMessage): number | undefine
 
 /**
  * helper 重启后的就绪探针没有浏览器 Cookie，`requestRejection` 会给 401。
- * 只对「本机回环 + GET status + 带 x-dsh-restart + 无 Origin」这一种请求放行；
+ * 只对「本机回环 + 恰好是 GET /dsh-restart/api/status + 带 x-dsh-restart + 无 Origin」放行；
  * 写操作（precheck/restart）永远不享受这个例外。
+ *
+ * 威胁模型（F3 的遗留）：这个例外看的是 remoteAddress。若本机有反向代理/隧道
+ * （cloudflared、frp、nginx -> 127.0.0.1:3080）且把 Host 也改写成回环地址，
+ * 外部未认证请求会继承回环来源。这里额外拒绝带 x-forwarded-for / forwarded 的请求，
+ * 能挡住常见代理，但挡不住主动剥头的代理。彻底做法是 helper 与宿主共享一个令牌文件，
+ * 或另开一个只回 204 的 /ready 路由（需要 Task 5 配合，本轮不动 helper）。
  */
-function isLocalReadinessProbe(req: IncomingMessage, expected: 'GET' | 'POST'): boolean {
+function isLocalReadinessProbe(req: IncomingMessage, expected: 'GET' | 'POST', routePath: string): boolean {
+  if (routePath !== STATUS_PATH) return false
   if (expected !== 'GET') return false
   if ((req.method ?? '').toUpperCase() !== 'GET') return false
+  if (pathOf(req.url) !== STATUS_PATH) return false
   const headers = headersRecord(req.headers)
   if (headerOf(headers, GUARD_HEADER) !== '1') return false
   if (headerOf(headers, 'origin') !== undefined) return false
+  if (headerOf(headers, 'x-forwarded-for') !== undefined) return false
+  if (headerOf(headers, 'forwarded') !== undefined) return false
+  const host = headerOf(headers, 'host')
+  if (host === undefined || !isLoopbackAuthority(host)) return false
   const address = req.socket?.remoteAddress
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
 }
 
-function guard(ctx: RouteContext, req: IncomingMessage, res: ServerResponse, expected: 'GET' | 'POST'): boolean {
+function isLoopbackAuthority(authority: string): boolean {
+  try {
+    const hostname = new URL('http://' + authority).hostname.replace(/^\[|\]$/g, '').toLowerCase()
+    return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1'
+  } catch {
+    return false
+  }
+}
+
+function pathOf(url: string | undefined): string {
+  const raw = url ?? ''
+  const query = raw.indexOf('?')
+  return query === -1 ? raw : raw.slice(0, query)
+}
+
+function guard(
+  ctx: RouteContext,
+  req: IncomingMessage,
+  res: ServerResponse,
+  expected: 'GET' | 'POST',
+  routePath: string,
+): boolean {
   let rejection = rejectionOf(ctx, req)
-  if (rejection === 401 && isLocalReadinessProbe(req, expected)) rejection = undefined
+  if (rejection === 401 && isLocalReadinessProbe(req, expected, routePath)) rejection = undefined
   if (!isAllowed({ method: req.method ?? '', headers: headersRecord(req.headers), rejection })) {
     respondJson(res, rejection ?? 403, { ok: false, error: '请求未通过来源检查' })
     return false
