@@ -480,6 +480,20 @@ describe('POST /dsh-restart/api/precheck', () => {
     expect(lines.at(-1)).toMatchObject({ done: true, saved: false, cancelled: true })
   })
 
+  it('头部设置抛错不会把预检互斥卡死', async () => {
+    const fake = makeCtx({ profile: PROFILE })
+    const handlers = createHandlers(fake.ctx, makeIo().io)
+    const broken = makeRes()
+    broken.setHeader = () => {
+      throw new Error('header boom')
+    }
+    await expect(call(handlers.precheck, makeReq({ method: 'POST' }), broken)).rejects.toThrow('header boom')
+
+    const second = await call(handlers.precheck, makeReq({ method: 'POST' }), makeRes())
+    expect(second.statusCode).toBe(200)
+    expect(ndjson(second).at(-1)).toMatchObject({ done: true, ok: true, saved: true })
+  })
+
   it('已有一轮预检时第二次直接 409，不排队也不重复跑', async () => {
     const fake = makeCtx({ profile: PROFILE })
     let releaseConfig: (value: Failure[]) => void = () => {}
@@ -680,6 +694,31 @@ describe('POST /dsh-restart/api/restart', () => {
     await call(createHandlers(fake.ctx, io).restart, makeReq({ method: 'POST' }), res)
     expect(res.statusCode).toBe(202)
     expect(scheduled).toHaveLength(1)
+  })
+
+  it('isRefused 挂起期间断开：不残留永久 409，仍派生 helper', async () => {
+    const fake = makeCtx({ profile: PROFILE, port: 3080 })
+    let releaseRefused: (value: boolean) => void = () => {}
+    const refusedGate = new Promise<boolean>((resolve) => {
+      releaseRefused = resolve
+    })
+    const scheduled: unknown[] = []
+    const { io } = makeIo({
+      isRefused: async () => refusedGate,
+      scheduleRestart: (options) => scheduled.push(options),
+    })
+    const handlers = createHandlers(fake.ctx, io)
+    const res = makeRes()
+    const first = call(handlers.restart, makeReq({ method: 'POST' }), res)
+    // 此时 handler 已停在 await io.isRefused()，close 早于 finish/close 收尾监听挂载。
+    res.emit('close')
+    releaseRefused(false)
+    await first
+    expect(res.statusCode).toBe(202)
+    expect(scheduled).toHaveLength(1)
+
+    const second = await call(handlers.restart, makeReq({ method: 'POST' }), makeRes())
+    expect(second.statusCode).toBe(202)
   })
 
   it('同一进程内双击：第二个 409，只派生一个 helper', async () => {

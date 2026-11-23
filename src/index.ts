@@ -196,7 +196,6 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
       respondJson(res, 409, { ok: false, error: '已有一轮预检在进行，等它结束再试' })
       return
     }
-    precheckRunning = true
 
     // 客户端断开就作废这轮结论；进程内没有中断冒烟的可靠办法，只能跑完再丢弃。
     let cancelled = false
@@ -249,6 +248,9 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
     }
 
     try {
+      // 置位放进 try：后面任何一步（包括同步的头部设置）抛错，finally 都会释放。
+      precheckRunning = true
+
       // 快检 A：配置合成本身会不会挂。
       const configFailures = await stage('config', () => io.runDumpConfig(profile.dir))
       write({ stage: 'config', ok: configFailures.length === 0, failures: configFailures })
@@ -387,6 +389,12 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
       released = true
       restartStarting = false
     }
+    // 客户端可能在 isRefused 挂起期间就断开；先记录，等判定完再决定怎么收尾。
+    // 不能在这里 release：否则第一个请求还没派生 helper，第二个请求就能挤进来。
+    let clientGone = false
+    res.once('close', () => {
+      clientGone = true
+    })
 
     try {
       const profile = profileOf(ctx)
@@ -435,15 +443,25 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
       res.statusCode = 202
       res.setHeader('content-type', 'application/json; charset=utf-8')
       res.setHeader('cache-control', 'no-store')
-      res.end(
-        JSON.stringify({
-          ok: true,
-          at,
-          port,
-          logDir: io.logDir,
-          profileName: profile.name,
-        }),
-      )
+      const body = JSON.stringify({
+        ok: true,
+        at,
+        port,
+        logDir: io.logDir,
+        profileName: profile.name,
+      })
+      if (clientGone) {
+        // close 早于上面的监听挂载：事件不会再触发，手动补 arm + release，别留下永久 409。
+        arm()
+        release()
+        try {
+          res.end(body)
+        } catch {
+          // 客户端已经走了。
+        }
+        return
+      }
+      res.end(body)
     } catch (error) {
       release()
       if (!res.headersSent) {
