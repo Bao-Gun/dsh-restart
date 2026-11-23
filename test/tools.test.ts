@@ -317,6 +317,12 @@ describe('dsh_restart_precheck', () => {
     return (await precheckOf(io).execute({}, exec)) as PrecheckValue
   }
 
+  /** execute 返回后必须放锁：漏放会让之后的预检永久 busy，只能重启宿主。 */
+  function expectReleased(): void {
+    expect(acquirePrecheck()).toBe(true)
+    releasePrecheck()
+  }
+
   it('通过时 ok:true、summary 含「通过」，并写一次 precheck', async () => {
     const written: Array<Partial<LastRecord>> = []
     const value = await runPrecheck(
@@ -340,6 +346,7 @@ describe('dsh_restart_precheck', () => {
     expect(value.summary).toContain('通过')
     expect(written).toHaveLength(1)
     expect(written[0]?.precheck).toMatchObject({ ok: true, fingerprint: '0123456789abcdef' })
+    expectReleased()
     expect(jsonProblems(value)).toEqual([])
   })
 
@@ -356,6 +363,7 @@ describe('dsh_restart_precheck', () => {
     expect(value.cancelled).toBe(false)
     expect(value.failures).toEqual(failures)
     expect(value.summary).toBe('检查没通过：试跑实例没起来')
+    expectReleased()
     expect(jsonProblems(value)).toEqual([])
   })
 
@@ -407,6 +415,7 @@ describe('dsh_restart_precheck', () => {
     expect(value.health).toBe(false)
     expect(value.summary).toBe('这轮预检被取消，不作数')
     expect(writes).toBe(0)
+    expectReleased()
     expect(jsonProblems(value)).toEqual([])
   })
 
@@ -441,6 +450,28 @@ describe('dsh_restart_precheck', () => {
     expect(value.ok).toBe(true)
     expect(value.saved).toBe(false)
     expect(value.summary).toContain('disk full')
+    expectReleased()
+    expect(jsonProblems(value)).toEqual([])
+  })
+
+  it('判红且写盘失败时，summary 同时带回第一条 failure 与 error', async () => {
+    const failures: Failure[] = [{ kind: 'boot', message: '试跑实例没起来', plugin: 'dsh-broken' }]
+    const value = await runPrecheck(
+      fakeIo({
+        runSmoke: async () => ({ ok: false, health: false, failures, failedEntries: [], durationMs: 1 }),
+        writeLast: async () => {
+          throw new Error('disk full')
+        },
+      }),
+    )
+
+    expect(value.ok).toBe(false)
+    expect(value.saved).toBe(false)
+    expect(value.failures).toEqual(failures)
+    // 工具值没有 error 字段，写盘失败这件事只能靠 summary 交代。
+    expect(value.summary).toContain('检查没通过：试跑实例没起来')
+    expect(value.summary).toContain('disk full')
+    expectReleased()
     expect(jsonProblems(value)).toEqual([])
   })
 })

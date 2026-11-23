@@ -154,7 +154,8 @@ function summaryOf(outcome: PrecheckOutcome): string {
   const error = typeof outcome.error === 'string' && outcome.error !== '' ? outcome.error : undefined
   if (!outcome.ok) {
     const first = outcome.failures[0]
-    if (first !== undefined) return '检查没通过：' + first.message
+    if (first !== undefined) return '检查没通过：' + first.message + (error === undefined ? '' : '（' + error + '）')
+    // 没拿到失败条目时，error 是唯一的出口；两者都没有才用兜底文案。
     return error ?? '检查没通过，但没拿到失败原因'
   }
   if (outcome.saved) return `检查通过：配置能合成，试跑实例起来了（${outcome.warnings.length} 条提示）`
