@@ -17,6 +17,8 @@
 | `.work/` | 草稿、临时计划（不进 git） | 任何还要留下的东西 |
 | `check.sh` | 唯一的验收脚本 | —— |
 
+两个 agent 工具在 `src/tools/`：`dsh_restart_precheck` 只预检，`dsh_restart` 会重启并中断当前会话；判定核心与路由共用，见 `docs/architecture.md`。
+
 ## 什么时候读什么
 
 | 你要做 | 先读 |

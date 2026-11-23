@@ -7,6 +7,10 @@
 | 模块 | 路径 | 职责 | 谁调用它 |
 |---|---|---|---|
 | 插件入口 | `src/index.ts` | 导出 `name` / `inject`，在 `apply(ctx)` 里向 `ctx.webServer.register` 挂三条 exact 路由（status / precheck / restart）；请求门（方法 + `x-dsh-restart: 1` + Origin 与 Host 一致）；precheck 用 NDJSON 逐行推三段；restart 回 202 后在 `finish` / `close` 事件里派生 helper；`precheckRunning` / `restartStarting` 进程内互斥 | 宿主插件加载器调 `apply`；浏览器弹窗发 HTTP 进来 |
+| 预检核心 | `src/server/precheck.ts` | 三段预检（config → compat → boot）、基线差分、`last.json` 落盘、取消语义；`acquirePrecheck` / `releasePrecheck` 是进程级互斥（路由与工具共用一把锁） | `src/index.ts` 的 precheck 路由、`src/tools/precheck.ts`、`src/tools/restart.ts` |
+| 重启核心 | `src/server/issue.ts` | `restartGuards`（profile → 端口 → restart.lock 三项守卫）、`armRestart` 立刻派生、`issueRestartLater` 延迟派生（返回取消函数）、`tryBeginRestart` / `endRestart` 进程互斥；不感知 HTTP | `src/index.ts` 的 restart 路由、`src/tools/restart.ts` |
+| profile 识别 | `src/server/profile.ts` | 只认 `ctx.get('profileContext')`，归一成 `{ dir, name, home }`（name / home 缺省从目录推）；取不到返回 undefined，由调用方 fail-closed | 三条路由与两个工具 |
+| agent 工具 | `src/tools/index.ts`、`src/tools/precheck.ts`、`src/tools/restart.ts`、`src/tools/schema.ts` | `toolsOf` 只走 `ctx.get('tools')`，`registerTools` 在 `ctx.effect` 里注册两个普通对象定义（不 import 宿主类型）；`dsh_restart_precheck` 跑预检核心，`dsh_restart` 走守卫 + 预检 + 延迟派生并 `concludeTurn`；`schema.ts` 是两边共用的输出 schema 与文本 render | `src/index.ts` 的 `apply` |
 | 上次结果 | `src/server/last.ts` | 读写 `~/.dsh/dsh-restart/last.json`（tmp 写 + rename，串行链）；profile 指纹 `sha256(pnpm-lock.yaml + \0 + dsh 版本)` 取前 16 位；`isStale` 判过期（取不到指纹也算过期） | `src/index.ts` 的 status 与 precheck 收尾 |
 | 兼容性快检 | `src/server/compat.ts` | 读 profile 的 `package.json` 依赖与 `cordis.patch.yml`（逐行扫，不引 YAML 库）；用宿主的 `evaluatePluginCompatibility` / `getDshRuntimeVersion` 判 engines 与 peer；宿主包按入口定位 dsh 安装根再 `createRequire` 加载，不静态 import；判不了也照样返回一条问题（fail-closed），但**这些结论在预检里只作「提示」**，不拦重启 | `src/index.ts` 的 precheck（compat 阶段） |
 | 冒烟 | `src/server/smoke.ts` | `runDumpConfig` 跑 `dsh --profile <name> --dump-config`；`runSmoke` 把 profile `cp -c -R` 克隆进临时 DSH_HOME，起 `--port 0 --no-open` 实例，探 /health 200，从 stderr 收 `did not activate` 名单（单复数 `1 entry` / `N entries` 都要认），`diffFailedEntries` 与基线差分；`killProcessTree` 杀整个进程组；finally 删临时目录 | `src/index.ts` 的 precheck（config / boot 阶段） |
@@ -24,6 +28,8 @@
 
 点菜单行 → 弹窗 `GET /dsh-restart/api/status`（端口、/health、上次结果 + 指纹是否过期）→ 点「开始模拟检查」`POST /dsh-restart/api/precheck`（NDJSON 逐行：config → compat → boot → done）→ 克隆 profile 起 `--port 0` 副本冒烟 → 写 `~/.dsh/dsh-restart/last.json` → 点「重启」`POST /dsh-restart/api/restart` 回 202 → `res` 的 finish/close 里派生脱离的 helper → helper 重启并跑两段探针（/health 200、插件 status 200）→ 弹窗轮询 status 看到 `restarting` 消失且 `health: true`，显示「已回来」。
 
+agent 调工具走同一套核心：`dsh_restart_precheck` → `runPrecheckRun`（不写第二份结果，落盘仍只有 `last.json` 一份）；`dsh_restart` → `restartGuards` → 复用新鲜预检或现场 `runPrecheckRun` → `issueRestartLater` 延迟派生 helper → `concludeTurn` 结束本轮，helper 在 2.5 秒后按与路由相同的流程重启。
+
 ## 关键约束
 
 - **运行期零第三方依赖。** 插件入口与 helper 只用 `node:` 内置模块和宿主已装的包；`@deepseek-ai/*` 全部 external，运行时从 dsh 安装根的 `node_modules` 里 `createRequire` 解析。打包它们会让 `getDshRuntimeVersion()` 读回插件自己的版本。
@@ -32,6 +38,8 @@
 - **先回话再重启。** 重启会掐掉当前请求所在的进程，202 必须真的落到 socket，然后在 `finish` / `close` 事件里才派生 helper；不能靠固定延时赌。关弹窗 abort 只会中止预检，已受理的重启照常执行。
 - **预检只拦两件事：配置合不出来、试启动起不来。** `ok = configFailures.length === 0 && bootOk`；插件版本不符、缺包、清单读不动、试跑里没激活的插件，一律进 `warnings` 只做提示。理由是宿主遇到这些只会跳过那个插件，dsh web 照样起得来（实机 `dsh-mcp-connector` 缺包就是这么跑的）；把它们当失败会让预检永远过不去。
 - **判定回来不能只看 /health。** 用错 profile / `DSH_HOME` 的实例同样 200 /health，但侧栏没有按钮；必须再探插件自己的 status 路由 200，探不到就报「插件未加载」，不能报「已重启」。
+- **工具与路由共用同一份核心与 io。** `apply` 里只造一个 `io`，三条路由与 `registerTools(ctx, io)` 共用；预检锁（`acquirePrecheck`）与重启锁（`tryBeginRestart`）也各只有一份进程状态。禁止在工具里另写判定或另造 io——否则「最近一次预检」与互斥状态会各说各话，弹窗和 agent 会看到两个结论。
+- **工具返回值必须过输出 schema 的强校验。** 两个工具的输出 `additionalProperties: false` 且每个字段都 `required`；早退分支（缺 profile、busy、取消、异常）也要把字段填满（`port: 0`、`profileName: ''`、`failures: []`、`warnings: []`），绝不能留 undefined；`Failure` 的可选字段缺了就不复制。
 - **两个 POST 不收无来历的请求。** 先过宿主 `connection.requestRejection`，再要求 `Origin` 与 `Host` 一致且带 `x-dsh-restart: 1`；唯一例外是 helper 重启后回环地址的只读 `GET status` 探针，precheck / restart 永不享受这个例外。
 
 ## 维护

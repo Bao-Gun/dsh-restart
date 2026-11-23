@@ -22,3 +22,5 @@
 - helper 是 detached 单进程，杀旧 web 后它自己崩了没人拉起；刚启动不到 15 秒时 daemon 还会 `restart skipped` 直接退 0 → 界面全无时只能终端救：`dsh-daemon status` → `dsh-daemon start` → 还不行 `dsh web` 前台看报错；实在不行把 profile 的 `cordis.patch.yml` 里 `restart-button` 那条 insert 块删掉再起（README「万一没回来」一节）。
 - 菜单行用统一 100ms 防抖补挂 → 菜单是点了「更多」才 portal 出来的，行要等一个防抖窗口才出现，肉眼能看见「菜单先弹、行后冒」的过程 → 菜单刚出现那一次必须在 MutationObserver 回调（微任务）里当场插，只有「已经在位」之后的重渲染噪声才防抖（src/client/inject.ts 的 `onMutations`）。
 - 预检判红用 `window.confirm` 做二次确认 → 宿主里是个阻塞弹框，与弹窗自己的视觉完全不搭，每次都要多点一次 → 改成弹窗内的「我知道风险」勾选框：勾上直接点亮重启按钮，勾选框只在「本轮跑完且判红」时显示（`src/client/dialog.ts` 的 `refreshGate`）。
+- 在 cordis 插件里直接读 `ctx.tools` 属性（未 `inject 'tools'`）→ 抛 `cannot get property "tools" without inject`；单测里的假 ctx 是普通对象，照不出这条规则，容易全绿上线才炸 → 必须 `ctx.get('tools')` 并自己判形状，取不到就当宿主没装工具服务（`src/tools/index.ts` 的 `toolsOf`）；`profileContext` 同理走 `ctx.get`（`src/server/profile.ts`）。
+- `dsh_restart` 里先 `concludeTurn()` 再 `issueRestartLater(...)` 排延迟派生 → 本轮可能立刻收尾，helper 还没排上，重启就丢了；反过来先派生再结束本轮，工具结果也来得及落盘 → 顺序必须是先 `issueRestartLater`、后 `concludeTurn`（`src/tools/restart.ts`）；2.5 秒延迟就是给落盘留的时间，helper 一启动就可能掐掉本进程。

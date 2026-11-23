@@ -120,7 +120,7 @@ it('dump-config 抛错时给出快检执行失败，而不是整体异常', asyn
 - [ ] **Step 2: 跑测试确认全红**
 
 Run: `pnpm vitest run test/precheck.test.ts`
-Expected: FAIL，`Cannot find module '../src/server/precheck'`
+Expected: FAIL，报找不到 precheck 模块
 
 - [ ] **Step 3: 实现 `src/server/precheck.ts`**
 
@@ -202,7 +202,7 @@ it('issueRestartLater 只在延迟后派生一次，cancel 后不派生', () => 
 - [ ] **Step 2: 跑测试确认全红**
 
 Run: `pnpm vitest run test/issue.test.ts`
-Expected: FAIL，找不到 `../src/server/issue`
+Expected: FAIL，报找不到 issue 模块
 
 - [ ] **Step 3: 实现 `src/server/issue.ts`**（守卫判断顺序必须与现有 handler 一致：profile → port → lock，错误文案沿用「取不到 profileContext，无法重启」等原文）
 
@@ -285,7 +285,7 @@ it('没有 tools 服务时不抛，返回 0 并打一条日志', () => { /* ctx.
 - [ ] **Step 2: 跑测试确认全红**
 
 Run: `pnpm vitest run test/tools.test.ts`
-Expected: FAIL，找不到 `../src/tools/index`
+Expected: FAIL，报找不到工具模块
 
 - [ ] **Step 3: 实现 `src/tools/index.ts` 的骨架**
 

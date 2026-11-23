@@ -1,6 +1,6 @@
 #!/bin/sh
 # 一条命令判断对不对。绿 = 全部通过，红 = 有东西坏了。
-# ①②③ 是骨架自带的；④ 是你的项目检查命令，现在还没配。
+# ①②③ 是骨架自带的；④ 是测试、构建与运行期依赖断言。
 cd "$(dirname "$0")" || exit 1
 fail=0
 bad() { printf '✗ %s\n' "$1" >&2; fail=1; }
@@ -32,6 +32,19 @@ done
 
 # ④ 测试 / 验收命令
 pnpm test || bad "测试失败"
+
+# 构建 + 运行期依赖断言：产物必须是零宿主依赖（源码里的包名字符串不算 import）
+pnpm build || bad "构建失败"
+if [ ! -f lib/index.js ]; then
+  bad "构建失败：lib/index.js 不存在"
+else
+  if grep -Eq "(^|[^A-Za-z0-9_$])(from|import|require)[[:space:]]*\(?[[:space:]]*[\"']@deepseek-ai/" lib/index.js; then
+    bad "lib/index.js 里出现对 @deepseek-ai/* 的 import/require（运行期必须零宿主依赖）"
+  fi
+  for name in dsh_restart_precheck dsh_restart; do
+    grep -q "$name" lib/index.js || bad "lib/index.js 里找不到工具名: $name"
+  done
+fi
 
 if [ "$fail" -eq 0 ]; then echo '✓ 全部通过'; else echo '✗ 有未通过项' >&2; fi
 exit "$fail"
