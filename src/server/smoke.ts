@@ -1,6 +1,7 @@
 import { execFile, spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { writeFileSync } from 'node:fs'
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { promisify } from 'node:util'
@@ -51,7 +52,10 @@ const STARTUP_PACKAGE_LINE = /^ {4}Package: /
 
 const SMOKE_DIR_PREFIX = 'dsh-smoke-'
 const RUN_PID_FILE = 'run.pid'
-const DSH_PID_FILE = 'dsh.pid'
+/** 试跑实例的 pid + 身份（lstart/command）；清扫前必须比对，防止 pid 复用误杀。 */
+const DSH_IDENTITY_FILE = 'dsh.json'
+/** 比一次冒烟（总墙钟约 15s）更保守；更年轻的目录可能正被并发冒烟使用。 */
+const STALE_DIR_MIN_AGE_MS = 30_000
 
 export interface SmokeOptions {
   profileDir: string
@@ -62,10 +66,12 @@ export interface SmokeOptions {
 
 export interface SmokeResult {
   /**
-   * 只表示试跑实例的 /health 200，不包含清理结果。
-   * 调用方必须同时要求 failures 为空、diffFailedEntries(本次, 基线) 的 added 为空，才算通过。
+   * health && 进程组确认清空 && 临时目录删干净。
+   * 调用方还必须要求 failures 为空、diffFailedEntries(本次, 基线) 的 added 为空。
    */
   ok: boolean
+  /** 单独保留 /health 是否 200，供展示用；不包含清理结果。 */
+  health: boolean
   /** 启动失败、克隆失败、清理失败这类硬失败；未激活名单不算失败。 */
   failures: Failure[]
   /** stderr 里本次未激活的条目 id，交给 diffFailedEntries 比基线。 */
@@ -156,6 +162,76 @@ function processAlive(pid: number): boolean {
   }
 }
 
+interface ProcessIdentity {
+  lstart: string
+  command: string
+}
+
+/** 只认命令行里真的出现 dsh；配合 lstart 与整条 command 比对，防 pid 复用误杀。 */
+function isDshCommand(command: string): boolean {
+  return /\bdsh\b/.test(command)
+}
+
+/** ps 的 lstart 与完整 command；取不到就返回 null，调用方按「无法确认」处理。 */
+async function probeProcessIdentity(pid: number): Promise<ProcessIdentity | null> {
+  if (process.platform === 'win32') return null
+  try {
+    const { stdout } = await execFileAsync(
+      'ps',
+      ['-p', String(pid), '-o', 'lstart=', '-o', 'command='],
+      { timeout: 2_000, maxBuffer: 64 * 1024, encoding: 'utf8' },
+    )
+    const line = stdout.trim()
+    const match = /^(\S{3}\s+\S{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$/.exec(line)
+    if (match === null) return null
+    const lstart = match[1] ?? ''
+    const command = (match[2] ?? '').trim()
+    if (lstart === '' || command === '') return null
+    return { lstart, command }
+  } catch {
+    return null
+  }
+}
+
+/** spawn 后落盘身份；写失败只会让后续陈旧清扫更保守（不发信号），不影响本次冒烟。 */
+async function recordDshIdentity(dir: string, pid: number): Promise<void> {
+  const identity = await probeProcessIdentity(pid)
+  if (identity === null || !isDshCommand(identity.command)) return
+  try {
+    await writeFile(
+      join(dir, DSH_IDENTITY_FILE),
+      JSON.stringify({ pid, lstart: identity.lstart, command: identity.command }),
+      'utf8',
+    )
+  } catch {
+    // 目录可能已被 finally 删掉，忽略
+  }
+}
+
+async function readDshIdentity(
+  dir: string,
+): Promise<{ pid: number; lstart: string; command: string } | null> {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(join(dir, DSH_IDENTITY_FILE), 'utf8'))
+    if (typeof parsed !== 'object' || parsed === null) return null
+    const record = parsed as Record<string, unknown>
+    const pid = record['pid']
+    const lstart = record['lstart']
+    const command = record['command']
+    if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return null
+    if (typeof lstart !== 'string' || lstart === '') return null
+    if (typeof command !== 'string' || command === '') return null
+    return { pid, lstart, command }
+  } catch {
+    return null
+  }
+}
+
+/** run.pid 必须同步落盘：mkdtemp 与写文件之间不能有 await，否则并发清扫会删到在飞目录。 */
+function writeRunPidFile(dir: string): void {
+  writeFileSync(join(dir, RUN_PID_FILE), String(process.pid), 'utf8')
+}
+
 function groupAlive(pid: number): boolean {
   if (process.platform === 'win32') return false
   try {
@@ -239,14 +315,6 @@ export async function killProcessTree(child: ChildProcess): Promise<boolean> {
   return terminateGroup(pid, KILL_GRACE_MS, KILL_KILL_GRACE_MS)
 }
 
-async function writePidFile(dir: string, name: string, pid: number): Promise<void> {
-  try {
-    await writeFile(join(dir, name), String(pid), 'utf8')
-  } catch {
-    // pid 文件只用于下一次清理陈旧目录，写失败不影响主流程
-  }
-}
-
 async function readPidFile(dir: string, name: string): Promise<number | null> {
   try {
     const raw = await readFile(join(dir, name), 'utf8')
@@ -259,7 +327,11 @@ async function readPidFile(dir: string, name: string): Promise<number | null> {
 
 /**
  * 上一次冒烟如果被外部重启/强杀打断，finally 不会执行，会留下 dsh-smoke-* 目录和 detached 试跑实例。
- * 每次冒烟前先收一遍：run.pid 还活着说明是并发中的冒烟，跳过；否则杀掉 dsh.pid 的进程组再删目录。
+ * 每次冒烟前先收一遍，顺序是：
+ * 1. 目录 mtime 太新（< 30s）→ 可能正在飞，跳过；
+ * 2. run.pid 对应的冒烟进程还活着 → 并发冒烟，跳过；
+ * 3. dsh.json 记录了 pid + lstart + command，三项与当前 ps 完全对上才发信号；
+ *    任何一项取不到或对不上 → 只删目录，绝不碰进程组（防 pid 复用误杀陌生进程）。
  */
 export async function cleanupStaleSmokeDirs(
   tmpRoot: string,
@@ -277,19 +349,40 @@ export async function cleanupStaleSmokeDirs(
   for (const entry of entries) {
     if (!entry.isDirectory() || !entry.name.startsWith(SMOKE_DIR_PREFIX)) continue
     const dir = join(tmpRoot, entry.name)
+
+    let ageMs: number
+    try {
+      ageMs = Date.now() - (await stat(dir)).mtimeMs
+    } catch {
+      continue
+    }
+    if (ageMs < STALE_DIR_MIN_AGE_MS) continue
+
     const ownerPid = await readPidFile(dir, RUN_PID_FILE)
     if (ownerPid !== null && processAlive(ownerPid)) continue
 
-    const dshPid = await readPidFile(dir, DSH_PID_FILE)
-    if (dshPid !== null) {
-      const cleaned = await terminateGroup(dshPid, KILL_GRACE_MS, KILL_KILL_GRACE_MS)
-      if (!cleaned) {
-        failures.push({
-          kind: 'boot',
-          message:
-            '陈旧冒烟目录 ' + dir + ' 的进程组 ' + String(dshPid) + ' 杀不掉，保留目录待人工处理',
-        })
-        continue
+    const identity = await readDshIdentity(dir)
+    if (identity !== null) {
+      const current = await probeProcessIdentity(identity.pid)
+      const confirmed =
+        current !== null &&
+        current.lstart === identity.lstart &&
+        current.command === identity.command &&
+        isDshCommand(current.command)
+      if (confirmed) {
+        const cleaned = await terminateGroup(identity.pid, KILL_GRACE_MS, KILL_KILL_GRACE_MS)
+        if (!cleaned) {
+          failures.push({
+            kind: 'boot',
+            message:
+              '陈旧冒烟目录 ' +
+              dir +
+              ' 的进程组 ' +
+              String(identity.pid) +
+              ' 杀不掉，保留目录待人工处理',
+          })
+          continue
+        }
       }
     }
 
@@ -486,7 +579,7 @@ async function runWebInClone(
   tmpHome: string,
   profileName: string,
   timeoutMs: number,
-): Promise<{ ok: boolean; failures: Failure[]; failedEntries: string[] }> {
+): Promise<{ health: boolean; cleaned: boolean; failures: Failure[]; failedEntries: string[] }> {
   const bin = resolveDshBin()
   const homeNote = '（试跑 DSH_HOME: ' + tmpHome + '，仅克隆 profile 层）'
   const child = spawn(bin, ['--profile', profileName, '--port', '0', '--no-open'], {
@@ -494,7 +587,6 @@ async function runWebInClone(
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: process.platform !== 'win32',
   })
-  if (child.pid !== undefined) await writePidFile(tmpHome, DSH_PID_FILE, child.pid)
 
   let stdout = ''
   let stderr = ''
@@ -506,7 +598,8 @@ async function runWebInClone(
   let urlWithoutPort: string | null = null
   let healthStatus: number | null = null
   let lastProbeError = ''
-  let ok = false
+  let health = false
+  let cleaned = true
 
   child.stdout?.setEncoding('utf8')
   child.stderr?.setEncoding('utf8')
@@ -528,6 +621,7 @@ async function runWebInClone(
   const streamClosed = new Promise<void>((resolveClosed) => {
     child.once('close', () => resolveClosed())
   })
+  if (child.pid !== undefined) void recordDshIdentity(tmpHome, child.pid)
 
   const failures: Failure[] = []
   const deadline = Date.now() + timeoutMs
@@ -544,7 +638,7 @@ async function runWebInClone(
           })
           healthStatus = response.status
           if (response.status === 200) {
-            ok = true
+            health = true
             break
           }
         } catch (error) {
@@ -554,7 +648,7 @@ async function runWebInClone(
       await delay(HEALTH_POLL_INTERVAL_MS)
     }
 
-    if (ok) {
+    if (health) {
       // 告警通常写在 URL 之前，但 stdout/stderr 是两个写者；等输出静默再取名单
       await settleOutput(() => lastOutputAt)
     } else if (exitRecords.length > 0) {
@@ -562,8 +656,8 @@ async function runWebInClone(
       await Promise.race([streamClosed, delay(EXIT_FLUSH_MS)])
     }
 
-    if (ok) {
-      // ok 语义保持「/health 200」；清理失败会在 finally 追加到 failures
+    if (health) {
+      // health 只表示 /health 200；清理结果由 finally 写入 cleaned
     } else if (spawnErrors.length > 0) {
       failures.push({
         kind: 'boot',
@@ -619,9 +713,8 @@ async function runWebInClone(
       })
     }
 
-    return { ok, failures, failedEntries: parseNotActivated(stderr) }
   } finally {
-    const cleaned = await killProcessTree(child)
+    cleaned = await killProcessTree(child)
     if (!cleaned) {
       failures.push({
         kind: 'boot',
@@ -631,11 +724,13 @@ async function runWebInClone(
       })
     }
   }
+
+  return { health, cleaned, failures, failedEntries: parseNotActivated(stderr) }
 }
 
 /**
  * 配置合成已在别处做过（runDumpConfig）；这里只负责「换个 DSH_HOME 真启动一次」。
- * ok 只代表 /health 200；调用方必须同时检查 failures 与基线差分的 added。
+ * ok = health && 进程组清空 && 临时目录删干净；调用方还必须要求 failures 为空、added 为空。
  *
  * 只克隆 profile 层：home 级的 .env / settings.yaml / plugins / daemon 不参与，
  * 所以试跑看到的环境分层可能与线上不同（理论上会造成假红或假绿）。
@@ -646,7 +741,9 @@ export async function runSmoke(options: SmokeOptions): Promise<SmokeResult> {
   const profileName = basename(profileDir)
   const timeoutMs = options.timeoutMs ?? DEFAULT_SMOKE_TIMEOUT_MS
   const failures: Failure[] = []
-  let ok = false
+  let health = false
+  let processesCleaned = true
+  let dirCleaned = true
   let failedEntries: string[] = []
   let tmpHome: string | null = null
 
@@ -659,7 +756,8 @@ export async function runSmoke(options: SmokeOptions): Promise<SmokeResult> {
 
     tmpHome = await mkdtemp(join(tmpRoot, SMOKE_DIR_PREFIX))
     const home = tmpHome
-    await writePidFile(home, RUN_PID_FILE, process.pid)
+    // 同步写：中间只要有 await，并发清扫就可能把刚 mkdtemp 的在飞目录当成孤儿删掉
+    writeRunPidFile(home)
     await mkdir(join(home, 'profiles'), { recursive: true })
 
     const clonedProfile = join(home, 'profiles', profileName)
@@ -671,7 +769,8 @@ export async function runSmoke(options: SmokeOptions): Promise<SmokeResult> {
       })
     } else {
       const run = await runWebInClone(home, profileName, timeoutMs)
-      ok = run.ok
+      health = run.health
+      processesCleaned = run.cleaned
       failedEntries = run.failedEntries
       failures.push(...run.failures)
     }
@@ -682,6 +781,7 @@ export async function runSmoke(options: SmokeOptions): Promise<SmokeResult> {
       try {
         await rm(tmpHome, { recursive: true, force: true })
       } catch (error) {
+        dirCleaned = false
         failures.push({
           kind: 'boot',
           message: '临时目录 ' + tmpHome + ' 清理失败：' + messageOf(error),
@@ -690,5 +790,6 @@ export async function runSmoke(options: SmokeOptions): Promise<SmokeResult> {
     }
   }
 
-  return { ok, failures, failedEntries, durationMs: Date.now() - startedAt }
+  const ok = health && processesCleaned && dirCleaned
+  return { ok, health, failures, failedEntries, durationMs: Date.now() - startedAt }
 }

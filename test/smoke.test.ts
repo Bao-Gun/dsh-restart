@@ -1,5 +1,5 @@
-import { spawn } from 'node:child_process'
-import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
+import { execFileSync, spawn } from 'node:child_process'
+import { mkdir, mkdtemp, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -40,6 +40,35 @@ function groupAlive(pid: number): boolean {
   } catch {
     return false
   }
+}
+
+/** 把目录 mtime 拨老，绕过「年轻目录视为在飞」的保护。 */
+async function makeOld(dir: string): Promise<void> {
+  const past = new Date(Date.now() - 60_000)
+  await utimes(dir, past, past)
+}
+
+function psIdentity(pid: number): { lstart: string; command: string } | null {
+  try {
+    const text = execFileSync('ps', ['-p', String(pid), '-o', 'lstart=', '-o', 'command='], {
+      encoding: 'utf8',
+    }).trim()
+    const match = /^(\S{3}\s+\S{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$/.exec(text)
+    if (match === null) return null
+    return { lstart: match[1] ?? '', command: (match[2] ?? '').trim() }
+  } catch {
+    return null
+  }
+}
+
+async function waitForPs(pid: number): Promise<{ lstart: string; command: string }> {
+  const deadline = Date.now() + 3_000
+  while (Date.now() < deadline) {
+    const identity = psIdentity(pid)
+    if (identity !== null) return identity
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50))
+  }
+  throw new Error('拿不到进程 ' + String(pid) + ' 的 ps 身份')
 }
 
 describe('parseNotActivated', () => {
@@ -139,16 +168,18 @@ describe('killProcessTree', () => {
 })
 
 describe('cleanupStaleSmokeDirs', () => {
-  it('父进程已死的目录清掉，父进程仍活的目录保留', async () => {
+  it('父进程已死的旧目录清掉，父进程仍活的目录保留', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-smoke-cleanup-'))
     try {
       const deadDir = join(root, 'dsh-smoke-dead')
       await mkdir(deadDir)
       await writeFile(join(deadDir, 'run.pid'), '999999')
+      await makeOld(deadDir)
 
       const aliveDir = join(root, 'dsh-smoke-alive')
       await mkdir(aliveDir)
       await writeFile(join(aliveDir, 'run.pid'), String(process.pid))
+      await makeOld(aliveDir)
 
       const result = await cleanupStaleSmokeDirs(root)
 
@@ -156,6 +187,135 @@ describe('cleanupStaleSmokeDirs', () => {
       expect(result.failures).toEqual([])
       await expect(stat(deadDir)).rejects.toBeTruthy()
       await expect(stat(aliveDir)).resolves.toBeTruthy()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('没有 run.pid 的旧目录直接删掉', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-smoke-cleanup-'))
+    try {
+      const dir = join(root, 'dsh-smoke-nopid')
+      await mkdir(dir)
+      await writeFile(join(dir, 'dsh.json'), 'not even valid json')
+      await makeOld(dir)
+
+      const result = await cleanupStaleSmokeDirs(root)
+
+      expect(result.removed).toEqual(['dsh-smoke-nopid'])
+      expect(result.failures).toEqual([])
+      await expect(stat(dir)).rejects.toBeTruthy()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('刚创建的在飞目录不会被清扫', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-smoke-cleanup-'))
+    try {
+      const dir = join(root, 'dsh-smoke-fresh')
+      await mkdir(dir)
+      await writeFile(join(dir, 'run.pid'), '999999')
+
+      const result = await cleanupStaleSmokeDirs(root)
+
+      expect(result.removed).toEqual([])
+      expect(result.failures).toEqual([])
+      await expect(stat(dir)).resolves.toBeTruthy()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.skipIf(process.platform === 'win32')(
+    '身份对不上时只删目录，不给进程组发信号',
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), 'dsh-smoke-cleanup-'))
+      const child = spawn('sh', ['-c', 'sleep 30'], { detached: true, stdio: 'ignore' })
+      const pid = child.pid
+      expect(pid).toBeTypeOf('number')
+      try {
+        const current = await waitForPs(pid!)
+        const dir = join(root, 'dsh-smoke-mismatch')
+        await mkdir(dir)
+        await writeFile(
+          join(dir, 'dsh.json'),
+          JSON.stringify({
+            pid,
+            // lstart 和 command 都伪造：就算 pid 活着也不能确认是试跑实例
+            lstart: 'Sun Jan  1 00:00:00 1970',
+            command: '/usr/local/bin/dsh web',
+          }),
+        )
+        await makeOld(dir)
+        expect(current.command).not.toBe('/usr/local/bin/dsh web')
+
+        const result = await cleanupStaleSmokeDirs(root)
+
+        expect(result.removed).toEqual(['dsh-smoke-mismatch'])
+        expect(result.failures).toEqual([])
+        expect(groupAlive(pid!)).toBe(true)
+        await expect(stat(dir)).rejects.toBeTruthy()
+      } finally {
+        try {
+          process.kill(-pid!, 'SIGKILL')
+        } catch {
+          // 已退出
+        }
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+    15_000,
+  )
+
+  it.skipIf(process.platform === 'win32')(
+    '身份匹配时杀掉旧试跑实例的进程组',
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), 'dsh-smoke-cleanup-'))
+      const script = join(root, 'dsh')
+      await writeFile(script, '#!/bin/sh\nsleep 30\n', { mode: 0o755 })
+      const child = spawn(script, [], { detached: true, stdio: 'ignore' })
+      const pid = child.pid
+      expect(pid).toBeTypeOf('number')
+      try {
+        const identity = await waitForPs(pid!)
+        expect(identity.command).toContain('dsh')
+
+        const dir = join(root, 'dsh-smoke-kill')
+        await mkdir(dir)
+        await writeFile(join(dir, 'dsh.json'), JSON.stringify({ pid, ...identity }))
+        await makeOld(dir)
+
+        const result = await cleanupStaleSmokeDirs(root)
+
+        expect(result.removed).toEqual(['dsh-smoke-kill'])
+        expect(result.failures).toEqual([])
+        expect(groupAlive(pid!)).toBe(false)
+        await expect(stat(dir)).rejects.toBeTruthy()
+      } finally {
+        try {
+          process.kill(-pid!, 'SIGKILL')
+        } catch {
+          // 已退出
+        }
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+    15_000,
+  )
+
+  it('非 dsh-smoke- 前缀目录不动', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-smoke-cleanup-'))
+    try {
+      const dir = join(root, 'other-dir')
+      await mkdir(dir)
+      await makeOld(dir)
+
+      const result = await cleanupStaleSmokeDirs(root)
+
+      expect(result.removed).toEqual([])
+      expect(result.failures).toEqual([])
+      await expect(stat(dir)).resolves.toBeTruthy()
     } finally {
       await rm(root, { recursive: true, force: true })
     }
