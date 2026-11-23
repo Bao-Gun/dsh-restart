@@ -11,7 +11,7 @@ import { defineConfig } from 'tsup'
 //   它和宿主入口一样把 @deepseek-ai/* 标成 external。
 // 注意：产物目录清理由 package.json 的 build 脚本负责（rm -rf lib）。
 // tsup 9 对数组配置是并发的（Promise.all），任何一份配置 clean: true 都会
-// 在另一份写完之后把它删掉，所以这里两份都不设 clean。
+// 在另一份写完之后把它删掉，所以这里三份都不设 clean。
 export default defineConfig([
   {
     entry: { index: 'src/index.ts' },
