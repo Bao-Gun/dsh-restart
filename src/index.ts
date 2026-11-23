@@ -11,7 +11,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { homedir, tmpdir } from 'node:os'
-import { basename, dirname, join } from 'node:path'
+import { join } from 'node:path'
 
 import type { LastRecord } from './shared/types'
 import { computeFingerprint, isStale, readLast, writeLast } from './server/last'
@@ -21,6 +21,8 @@ import { acquirePrecheck, releasePrecheck, runPrecheckRun } from './server/prech
 import type { PrecheckIo, PrecheckOutcome, PrecheckTarget } from './server/precheck'
 import { RESTART_BUSY_ERROR, armRestart, endRestart, restartGuards, tryBeginRestart } from './server/issue'
 import type { RestartIssueIo } from './server/issue'
+import { profileOf } from './server/profile'
+import { registerTools } from './tools/index'
 import {
   PLUGIN_STATUS_PATH,
   RESTART_LOCK_NAME,
@@ -121,7 +123,10 @@ export function isAllowed(input: AllowedInput): boolean {
 
 /** 宿主入口。三条路由分开注册，单条 dispose 也不影响另外两条。 */
 export function apply(ctx: RouteContext): void {
-  const handlers = createHandlers(ctx)
+  // 路由与工具必须共用同一个 io：互斥状态在核心模块里，但日志目录等
+  // 一旦各造一份，两边的「最近一次预检」就不再是同一份。
+  const io = defaultIo()
+  const handlers = createHandlers(ctx, {}, io)
   const routes: Array<[string, RouteHandler]> = [
     [STATUS_PATH, handlers.status],
     [PRECHECK_PATH, handlers.precheck],
@@ -130,10 +135,19 @@ export function apply(ctx: RouteContext): void {
   for (const [path, handler] of routes) {
     ctx.effect(() => ctx.webServer.register({ kind: 'exact', path, handler }), `dsh-restart: ${path}`)
   }
+  // 没有 tools 服务时 registerTools 自己返回 0，不影响三条路由。
+  registerTools(ctx, io)
 }
 
-export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = {}): Handlers {
-  const io = withOverrides(defaultIo(), overrides)
+/**
+ * 路由处理器工厂。第三个参数是已经造好的共享 io；测试仍可只传 overrides，
+ * 这时和以前一样在 defaultIo 上覆盖。
+ */
+export function createHandlers(
+  ctx: RouteContext,
+  overrides: Partial<RouteIo> = {},
+  io: RouteIo = withOverrides(defaultIo(), overrides),
+): Handlers {
   // 预检/重启的进程内互斥都在各自的 core 里（acquirePrecheck / tryBeginRestart），
   // 路由与工具共用那一把锁；跨进程仍以 helper 的 restart.lock 为准。
 
@@ -374,27 +388,6 @@ function withOverrides(base: RouteIo, overrides: Partial<RouteIo>): RouteIo {
     if (value !== undefined) merged[key] = value
   }
   return merged as unknown as RouteIo
-}
-
-interface ProfileInfo {
-  dir: string
-  name: string
-  home: string
-}
-
-function profileOf(ctx: RouteContext): ProfileInfo | undefined {
-  let value: unknown
-  try {
-    value = ctx.get('profileContext')
-  } catch {
-    return undefined
-  }
-  if (!isRecord(value)) return undefined
-  const dir = value.dir
-  if (typeof dir !== 'string' || dir.trim() === '') return undefined
-  const name = typeof value.name === 'string' && value.name !== '' ? value.name : basename(dir)
-  const home = typeof value.home === 'string' && value.home !== '' ? value.home : dirname(dirname(dir))
-  return { dir, name, home }
 }
 
 function currentPort(ctx: RouteContext): number | undefined {
