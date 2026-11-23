@@ -566,6 +566,8 @@ describe('dsh_restart', () => {
     expect(value).toMatchObject({ ok: true, restarted: true, reason: 'restarting', port: 3080, profileName: 'web' })
     expect(value.failures).toEqual([])
     expect(value.warnings).toEqual([])
+    expect(value.summary).toContain('中断')
+    expect(value.summary).toContain('硬刷')
     expect(value.summary).toContain('重启')
     expect(smoked).toBe(0)
     expect(concluded).toBe(1)
@@ -638,6 +640,24 @@ describe('dsh_restart', () => {
     expect(jsonProblems(value)).toEqual([])
   })
 
+  it('判红但没拿到 failure 条目时，summary 用统一兜底文案', async () => {
+    const scheduled: ScheduleRestartOptions[] = []
+    const value = await runRestart(
+      fakeIo({
+        runSmoke: async () => ({ ok: false, health: false, failures: [], failedEntries: [], durationMs: 1 }),
+        scheduleRestart: (options) => {
+          scheduled.push(options)
+        },
+      }),
+    )
+
+    expect(value).toMatchObject({ ok: false, restarted: false, reason: 'precheck-failed' })
+    expect(value.summary).toContain('没拿到失败原因')
+    vi.advanceTimersByTime(5000)
+    expect(scheduled).toHaveLength(0)
+    expect(jsonProblems(value)).toEqual([])
+  })
+
   it('force=true 时不跑预检直接重启', async () => {
     const scheduled: ScheduleRestartOptions[] = []
     let smoked = 0
@@ -665,6 +685,38 @@ describe('dsh_restart', () => {
     expect(concluded).toBe(1)
     vi.advanceTimersByTime(2500)
     expect(scheduled).toHaveLength(1)
+    expect(jsonProblems(value)).toEqual([])
+  })
+
+  it('force=true 也不越过守卫：restart.lock 被占时 reason busy、不派生', async () => {
+    const scheduled: ScheduleRestartOptions[] = []
+    let smoked = 0
+    let concluded = 0
+    const value = await runRestart(
+      fakeIo({
+        isRefused: async () => true,
+        runSmoke: async () => {
+          smoked += 1
+          return { ok: true, health: true, failures: [], failedEntries: [], durationMs: 1 }
+        },
+        scheduleRestart: (options) => {
+          scheduled.push(options)
+        },
+      }),
+      { force: true },
+      {
+        concludeTurn: () => {
+          concluded += 1
+        },
+      },
+    )
+
+    expect(value).toMatchObject({ ok: false, restarted: false, reason: 'busy', port: 3080, profileName: 'web' })
+    expect(value.summary).toContain('等它结束')
+    expect(smoked).toBe(0)
+    expect(concluded).toBe(0)
+    vi.advanceTimersByTime(5000)
+    expect(scheduled).toHaveLength(0)
     expect(jsonProblems(value)).toEqual([])
   })
 

@@ -4,6 +4,7 @@
  * 输出 schema 会被宿主按 JSON Schema 强校验（additionalProperties: false），
  * 所以执行体返回值里不得出现 undefined / 函数 / 类实例；这里只声明 JSON 值。
  */
+import type { Failure } from '../shared/types'
 import type { ToolTextBlock } from './index'
 
 /** Failure（src/shared/types.ts）的 JSON Schema：plugin / expected / actual 可省。 */
@@ -32,6 +33,18 @@ export function summaryTextOf(value: unknown): string {
 /** 只回一行文本的工具 render。 */
 export function renderSummary(_args: unknown, value: unknown): ToolTextBlock[] {
   return [{ type: 'text', text: summaryTextOf(value) }]
+}
+
+/**
+ * 判红时的一句话（预检与重启工具共用）：
+ * - 第一条 failure 的 message 打头，写盘错误有就补在括号里；
+ * - 没有 failure 条目时 error 是唯一出口，两者都没有才用兜底文案。
+ */
+export function redSummaryOf(outcome: { failures: Failure[]; error?: string }): string {
+  const first = outcome.failures[0]
+  const error = typeof outcome.error === 'string' && outcome.error !== '' ? outcome.error : undefined
+  if (first !== undefined) return '检查没通过：' + first.message + (error === undefined ? '' : '（' + error + '）')
+  return error ?? '检查没通过，但没拿到失败原因'
 }
 
 /** Failure 的单行文本：缺的字段就不提，别把 undefined 拼进来。 */

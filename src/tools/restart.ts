@@ -17,7 +17,7 @@ import type { PrecheckOutcome, PrecheckTarget } from '../server/precheck'
 import { profileOf } from '../server/profile'
 import type { Failure } from '../shared/types'
 import type { ToolContextLike, ToolDefinitionLike, ToolExecLike, ToolIo } from './index'
-import { FAILURE_SCHEMA, renderWithIssues } from './schema'
+import { FAILURE_SCHEMA, redSummaryOf, renderWithIssues } from './schema'
 
 /** force 是唯一参数：预检判红时仍需显式传 true 才放行。 */
 const PARAMETERS: Record<string, unknown> = {
@@ -119,13 +119,6 @@ async function freshPassed(io: ToolIo, target: PrecheckTarget): Promise<boolean>
   if (record?.precheck?.ok !== true) return false
   const fingerprint = await io.computeFingerprint(target.dir, io.runtimeVersion())
   return !isStale(record, fingerprint)
-}
-
-/** 判红时的一句话：第一条 failure 打头，写盘错误有就补上。 */
-function redSummary(outcome: PrecheckOutcome): string {
-  const first = outcome.failures[0]
-  const head = first === undefined ? '检查没通过' : '检查没通过：' + first.message
-  return outcome.error === undefined ? head : head + '（' + outcome.error + '）'
 }
 
 function messageOf(err: unknown): string {
@@ -241,7 +234,7 @@ export function createRestartTool(ctx: ToolContextLike, io: ToolIo): ToolDefinit
                 reason: 'precheck-failed',
                 failures: outcome.failures,
                 warnings: outcome.warnings,
-                summary: redSummary(outcome),
+                summary: redSummaryOf(outcome),
               })
             }
           }
@@ -255,7 +248,12 @@ export function createRestartTool(ctx: ToolContextLike, io: ToolIo): ToolDefinit
             ok: true,
             restarted: true,
             reason: 'restarting',
-            summary: '重启已排入队列：约 2.5 秒后重启 dsh web（端口 ' + port + '，profile ' + target.name + '）',
+            summary:
+              '已发出重启，本会话很快会被中断：约 2.5 秒后重启 dsh web（端口 ' +
+              port +
+              '，profile ' +
+              target.name +
+              '）；重启完成后硬刷页面。',
           })
         } finally {
           release()

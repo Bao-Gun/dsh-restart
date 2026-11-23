@@ -13,7 +13,7 @@ import type { PrecheckOutcome } from '../server/precheck'
 import { profileOf } from '../server/profile'
 import type { Failure } from '../shared/types'
 import type { ToolContextLike, ToolDefinitionLike, ToolExecLike, ToolIo } from './index'
-import { FAILURE_SCHEMA, renderWithIssues } from './schema'
+import { FAILURE_SCHEMA, redSummaryOf, renderWithIssues } from './schema'
 
 const PARAMETERS: Record<string, unknown> = { type: 'object', properties: {}, additionalProperties: false }
 
@@ -152,12 +152,7 @@ function summaryOf(outcome: PrecheckOutcome): string {
   if (outcome.cancelled) return CANCELLED_SUMMARY
 
   const error = typeof outcome.error === 'string' && outcome.error !== '' ? outcome.error : undefined
-  if (!outcome.ok) {
-    const first = outcome.failures[0]
-    if (first !== undefined) return '检查没通过：' + first.message + (error === undefined ? '' : '（' + error + '）')
-    // 没拿到失败条目时，error 是唯一的出口；两者都没有才用兜底文案。
-    return error ?? '检查没通过，但没拿到失败原因'
-  }
+  if (!outcome.ok) return redSummaryOf(outcome)
   if (outcome.saved) return `检查通过：配置能合成，试跑实例起来了（${outcome.warnings.length} 条提示）`
   return error ?? '检查通过，但拿不到 profile 指纹，结果没落盘'
 }
