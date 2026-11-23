@@ -18,7 +18,7 @@
 | helper 入口 | `src/helper/restart.ts` | 从 `DSH_RESTART_*` 环境变量解析配置（错误写 stderr 与 `helper-last-error.log`）；只在被直接执行时跑 `helperMain` | `scheduleRestart` 拉起的 node 进程 |
 | 客户端入口 | `src/client/index.ts` | 由宿主 `window.__ModuleLoader__.load({id, factory})` 装载，factory 返回带 `apply` 的对象；`apply` 挂菜单行注入器、点开时懒挂弹窗，`ctx.effect` 里清理 | 宿主 ClientModuleSystem |
 | 菜单行注入 | `src/client/inject.ts` | MutationObserver 找 `[role=menu]` 且标签含「设置 / 退出」的账号菜单，把自建行插到最后一行 menuitem 之前（= 倒数第二行）；文案「重启」。**菜单一出现就在回调的微任务里当场插**（赶在绘制前，用户看不到行冒出来），已插好后的重渲染噪声才走 100ms 防抖；被重渲染冲掉会当场补回。**只在菜单里插，不做侧栏底部的退路行**——实机上那条退路会与「更多」并排，把「更多」挤掉 | `src/client/index.ts` 的 `apply` |
-| 弹窗 | `src/client/dialog.ts`（样式 `src/client/dialog.css.ts`） | 五段 UI（端口 / 健康 / 模拟检查 / 重启 / 上次结果）；上次结果的时间把落盘的 UTC ISO 转成本机时区再显示；三个请求都带 `x-dsh-restart: 1`；precheck 按 NDJSON 逐行画阶段（`failures` 画红、`warnings` 画黄且不参与门禁）；重启后轮询 status，必须先见 `restarting` 再见 `health===true` 才算回来（90s 超时），回来后**自己关掉弹窗并 `location.reload()` 刷新当前页**（不新开标签页，也不叫用户手刷）；本轮判红时下方露出「我知道风险，勾上后直接重启」勾选框，勾上即点亮重启按钮、直接发请求（不弹 `confirm`）；通过时勾选框收起并清掉勾选；`close()` 里 `token++` + abort 在飞请求 | `src/client/index.ts`（点菜单行时 mount 并 open） |
+| 弹窗 | `src/client/dialog.ts`（样式 `src/client/dialog.css.ts`） | 五段 UI（端口 / 健康 / 模拟检查 / 重启 / 上次结果）；上次结果的时间把落盘的 UTC ISO 转成本机时区再显示；三个请求都带 `x-dsh-restart: 1`；precheck 按 NDJSON 逐行画阶段（`failures` 画红、`warnings` 画黄且不参与门禁）；重启后轮询 status，必须先见 `restarting` 再见 `health===true` 才算回来（90s 超时），回来后**自己关掉弹窗并 `location.reload()` 刷新当前页**（不新开标签页，也不叫用户手刷）；只有一颗「重启」按钮：不勾「跳过检查」时点它先跑预检、全过才自己接着发重启（判红就停住、不发请求）；勾上「我知道风险，跳过检查直接重启」则跳过预检直接发重启（不弹 `confirm`）。勾选框常显、默认不勾；检查或重启进行中，按钮与勾选框一起禁用。`close()` 里 `token++` + abort 在飞请求 | `src/client/index.ts`（点菜单行时 mount 并 open） |
 | 共享类型 | `src/shared/types.ts`、`src/shared/version.ts` | 服务端与客户端共用的记录形状（`LastRecord` / `PrecheckResult` / `Failure`）；`parseRuntime` 解析宿主版本，非法就抛 | 两端都 import |
 | 安装 | `scripts/install.mjs` | 默认 dry-run 打印计划；`--apply` 按「依赖 → 清悬空旧软链 → 建 `node_modules` 软链 → 最后写 `cordis.patch.yml`」的顺序落盘（`package.json` 的依赖是 `link:<repo>`，patch 用 insert 块）；中途失败留步骤表并提示重跑自愈，最坏态只会是「链在但配置没认领」（无害），不会出现配置认领不存在的包；写完若本次动了依赖或补了 patch，再跑一次 `pnpm install --lockfile-only --offline` 把 lockfile 补齐（20s 超时，失败只告警）。`--verify` 在 `cp -c` 克隆的临时 DSH_HOME 里重做安装并起 `--port 0` 实例，探 /health 200 且 status 200 + `body.ok` 才算 PASS | 人工执行 |
 
@@ -26,7 +26,7 @@
 
 ## 数据流
 
-点菜单行 → 弹窗 `GET /dsh-restart/api/status`（端口、/health、上次结果 + 指纹是否过期）→ 点「开始模拟检查」`POST /dsh-restart/api/precheck`（NDJSON 逐行：config → compat → boot → done）→ 克隆 profile 起 `--port 0` 副本冒烟 → 写 `~/.dsh/dsh-restart/last.json` → 点「重启」`POST /dsh-restart/api/restart` 回 202 → `res` 的 finish/close 里派生脱离的 helper → helper 重启并跑两段探针（/health 200、插件 status 200）→ 弹窗轮询 status 看到 `restarting` 消失且 `health: true` → 关掉弹窗并刷新当前页（新宿主加载新插件、侧栏重新出现按钮）。
+点菜单行 → 弹窗 `GET /dsh-restart/api/status`（端口、/health、上次结果 + 指纹是否过期）→ 点「重启」：没勾「跳过检查」就先 `POST /dsh-restart/api/precheck`（NDJSON 逐行：config → compat → boot → done）→ 克隆 profile 起 `--port 0` 副本冒烟 → 写 `~/.dsh/dsh-restart/last.json` → 判红则停在这里不发重启（勾上「跳过检查」再点可绕过）→ 全过才自动 `POST /dsh-restart/api/restart` 回 202 → `res` 的 finish/close 里派生脱离的 helper → helper 重启并跑两段探针（/health 200、插件 status 200）→ 弹窗轮询 status 看到 `restarting` 消失且 `health: true` → 关掉弹窗并刷新当前页（新宿主加载新插件、侧栏重新出现按钮）。
 
 agent 调工具走同一套核心：`dsh_restart_precheck` → `runPrecheckRun`（不写第二份结果，落盘仍只有 `last.json` 一份）；`dsh_restart` → `restartGuards` → 复用新鲜预检或现场 `runPrecheckRun` → `issueRestartLater` 延迟派生 helper → `concludeTurn` 结束本轮，helper 在 2.5 秒后按与路由相同的流程重启。
 
@@ -35,6 +35,7 @@ agent 调工具走同一套核心：`dsh_restart_precheck` → `runPrecheckRun`�
 - **运行期零第三方依赖。** 插件入口与 helper 只用 `node:` 内置模块和宿主已装的包；`@deepseek-ai/*` 全部 external，运行时从 dsh 安装根的 `node_modules` 里 `createRequire` 解析。打包它们会让 `getDshRuntimeVersion()` 读回插件自己的版本。
 - **插件坏了只能降级成「按钮不出现」，绝不能拖垮 dsh web 启动。** 模块解析不到、路由注册失败、快检抛错，宿主都只是把这一条插件标记为未激活（stderr 一句 `1 entry did not activate`），dsh web 照常起。所以客户端与服务端都不能在加载期做重活、不能抛。
 - **预检绝不动真实 profile。** 对 `~/.dsh/profiles/web` 只读；所有写入都发生在 `cp -c`（APFS clonefile）克隆出来的临时 DSH_HOME 里，跑完连目录一起删。运行期唯一写盘是 `last.json`，且是 tmp + rename 的原子写。
+- **不勾「跳过检查」就绝不跳过预检。** 弹窗只有一条发重启的路径：`clickRestart()` 先看勾选框——勾了才直接 `startRestart()`，没勾必须 `await runPrecheck()` 返回 true 才继续；预检本身不再有独立按钮，也不接受「上次通过」当本轮通过（指纹过期会重新检查）。服务端不据此放宽：路由与 `dsh_restart` 工具都仍按 `last.json` + 指纹自己判。
 - **先回话再重启。** 重启会掐掉当前请求所在的进程，202 必须真的落到 socket，然后在 `finish` / `close` 事件里才派生 helper；不能靠固定延时赌。关弹窗 abort 只会中止预检，已受理的重启照常执行。
 - **预检只拦两件事：配置合不出来、试启动起不来。** `ok = configFailures.length === 0 && bootOk`；插件版本不符、缺包、清单读不动、试跑里没激活的插件，一律进 `warnings` 只做提示。理由是宿主遇到这些只会跳过那个插件，dsh web 照样起得来（实机 `dsh-mcp-connector` 缺包就是这么跑的）；把它们当失败会让预检永远过不去。
 - **重启完不许再新开标签页。** `dsh-daemon` 的 watchdog 里 `OPEN_BROWSER` 是写死的 `1`，`DSH_DAEMON_OPEN_BROWSER` 这个变量根本没接上，唯一外部闸口是 `SSH_CONNECTION` / `SSH_TTY`；所以 helper 派生 daemon 时必须自己塞 `DSH_DAEMON_OPEN_BROWSER=0` + 假 `SSH_CONNECTION`，页面由弹窗自己刷新。

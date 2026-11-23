@@ -189,10 +189,6 @@ export const dialogCss = `
   cursor: pointer;
   user-select: none;
 }
-/* display:flex 会盖掉 hidden 的默认 display:none，得自己补一条。 */
-.dsh-restart-ack[hidden] {
-  display: none;
-}
 .dsh-restart-ack input {
   margin: 0;
   accent-color: var(--dsw-alias-state-error-primary, #c02626);

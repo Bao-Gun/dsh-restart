@@ -364,10 +364,6 @@ async function waitFor(check: () => boolean, timeoutMs = 3000): Promise<void> {
   }
 }
 
-function precheckButton(): HTMLButtonElement {
-  return document.querySelector('[data-dsh-restart-precheck]') as HTMLButtonElement
-}
-
 function restartButton(): HTMLButtonElement {
   return document.querySelector('[data-dsh-restart-restart]') as HTMLButtonElement
 }
@@ -418,8 +414,10 @@ describe('mountDialog：五段与状态', () => {
     expect(calls).toHaveLength(1)
     expect(calls[0]?.url).toBe('/dsh-restart/api/status')
     expect(calls[0]?.init.headers?.['x-dsh-restart']).toBe('1')
-    // 上次通过且未过期：按钮可以直接点。
-    expect((document.querySelector('[data-dsh-restart-restart]') as HTMLButtonElement | null)?.disabled).toBe(false)
+    // 勾选框常显、默认不勾；按钮随时能点（点了会先预检）。
+    expect(ackWrap().hidden).toBe(false)
+    expect(ackInput().checked).toBe(false)
+    expect(restartButton().disabled).toBe(false)
   })
 
   it('上次结果的时间按本机时区显示，不直接切 ISO 字符串', async () => {
@@ -443,7 +441,7 @@ describe('mountDialog：五段与状态', () => {
     if (local.getTimezoneOffset() !== 0) expect(rendered).not.toContain(at.slice(0, 16).replace('T', ' '))
   })
 
-  it('指纹过期时禁用重启按钮并提示重新检查', async () => {
+  it('指纹过期：按钮照样能点，点下去会重新检查', async () => {
     const { fetchImpl } = fakeFetch({
       '/dsh-restart/api/status': jsonResponse(statusPayload({
         stale: true,
@@ -455,10 +453,11 @@ describe('mountDialog：五段与状态', () => {
     await settle()
 
     expect(textOf('[data-dsh-restart-last]')).toContain('已过期')
-    expect((document.querySelector('[data-dsh-restart-restart]') as HTMLButtonElement | null)?.disabled).toBe(true)
+    expect(noticeText()).toContain('这次重启会重新检查')
+    expect(restartButton().disabled).toBe(false)
   })
 
-  it('NDJSON 逐行更新阶段文案与失败列表；未通过时禁用重启', async () => {
+  it('点重启先跑预检：NDJSON 逐行渲染，判红不发重启请求', async () => {
     const lines = [
       JSON.stringify({ stage: 'config', ok: true, failures: [] }),
       JSON.stringify({
@@ -478,12 +477,13 @@ describe('mountDialog：五段与状态', () => {
     dialog.open()
     await settle()
 
-    precheckButton().click()
-    await waitFor(() => precheckButton().disabled === false)
+    restartButton().click()
+    await waitFor(() => noticeText().includes('预检没通过'))
 
     const precheckCall = calls.find((call) => call.url === '/dsh-restart/api/precheck')
     expect(precheckCall?.init.method).toBe('POST')
     expect(precheckCall?.init.headers?.['x-dsh-restart']).toBe('1')
+    expect(calls.filter((call) => call.url === '/dsh-restart/api/precheck')).toHaveLength(1)
     expect(textOf('[data-dsh-restart-stage="config"]')).toContain('通过')
     expect(textOf('[data-dsh-restart-stage="compat"]')).toContain('未通过')
     expect(textOf('[data-dsh-restart-stage="boot"]')).toContain('通过')
@@ -492,10 +492,12 @@ describe('mountDialog：五段与状态', () => {
     expect(failures[0]?.textContent).toContain('bad-plugin')
     expect(failures[0]?.textContent).toContain('>=0.2.2')
     expect(failures[0]?.textContent).toContain('0.1.0')
-    expect((document.querySelector('[data-dsh-restart-restart]') as HTMLButtonElement).disabled).toBe(true)
+    expect(calls.some((call) => call.url === '/dsh-restart/api/restart')).toBe(false)
+    expect(restartButton().disabled).toBe(false)
+    expect(noticeText()).toContain('预检没通过（1 项）')
   })
 
-  it('全部阶段通过后启用重启按钮', async () => {
+  it('预检全过就自己发重启，不用点第二次', async () => {
     const lines = [
       JSON.stringify({ stage: 'config', ok: true, failures: [] }),
       JSON.stringify({ stage: 'compat', ok: true, failures: [] }),
@@ -503,21 +505,30 @@ describe('mountDialog：五段与状态', () => {
       JSON.stringify({ done: true }),
     ].join('\n') + '\n'
 
-    const { fetchImpl } = fakeFetch({
+    const { calls, fetchImpl } = fakeFetch({
       '/dsh-restart/api/status': jsonResponse(statusPayload({ last: {} })),
       '/dsh-restart/api/precheck': ndjsonResponse(lines, 3),
+      '/dsh-restart/api/restart': jsonResponse({ ok: true, at: '2026-11-23T04:00:01.000Z', port: 3080 }, 202),
     })
-    const dialog = mountDialog(document, { fetchImpl })
+    const dialog = mountDialog(document, { fetchImpl, pollIntervalMs: 5000 })
     dialog.open()
     await settle()
-    expect((document.querySelector('[data-dsh-restart-restart]') as HTMLButtonElement).disabled).toBe(true)
 
-    precheckButton().click()
-    await waitFor(() => restartButton().disabled === false)
-    expect(restartButton().disabled).toBe(false)
+    restartButton().click()
+    await waitFor(() => calls.some((call) => call.url === '/dsh-restart/api/restart'))
+
+    const precheckIndex = calls.findIndex((call) => call.url === '/dsh-restart/api/precheck')
+    const restartIndex = calls.findIndex((call) => call.url === '/dsh-restart/api/restart')
+    expect(precheckIndex).toBeGreaterThanOrEqual(0)
+    expect(restartIndex).toBeGreaterThan(precheckIndex)
+    expect(calls[precheckIndex]?.init.headers?.['x-dsh-restart']).toBe('1')
+    const restartCall = calls[restartIndex]
+    expect(restartCall?.init.method).toBe('POST')
+    expect(restartCall?.init.headers?.['x-dsh-restart']).toBe('1')
+    dialog.close()
   })
 
-  it('插件问题只作提示：阶段仍算通过，提示单独列出，按钮可用', async () => {
+  it('插件问题只作提示：阶段仍算通过，提示单独列出，不拦重启', async () => {
     const lines = [
       JSON.stringify({ stage: 'config', ok: true, failures: [] }),
       JSON.stringify({
@@ -538,15 +549,16 @@ describe('mountDialog：五段与状态', () => {
       JSON.stringify({ done: true, ok: true, saved: true, fingerprint: 'fp-1' }),
     ].join('\n') + '\n'
 
-    const { fetchImpl } = fakeFetch({
+    const { calls, fetchImpl } = fakeFetch({
       '/dsh-restart/api/status': jsonResponse(statusPayload({ last: {} })),
       '/dsh-restart/api/precheck': ndjsonResponse(lines, 3),
+      '/dsh-restart/api/restart': jsonResponse({ ok: true, at: '2026-11-23T04:00:01.000Z', port: 3080 }, 202),
     })
-    const dialog = mountDialog(document, { fetchImpl })
+    const dialog = mountDialog(document, { fetchImpl, pollIntervalMs: 5000 })
     dialog.open()
     await settle()
-    precheckButton().click()
-    await waitFor(() => restartButton().disabled === false)
+    restartButton().click()
+    await waitFor(() => document.querySelectorAll('[data-dsh-restart-warning]').length === 2)
 
     expect(textOf('[data-dsh-restart-stage="compat"]')).toContain('通过')
     expect(textOf('[data-dsh-restart-stage="compat"]')).toContain('1 条提示')
@@ -556,9 +568,9 @@ describe('mountDialog：五段与状态', () => {
     expect(warnings[0]?.textContent).toContain('dsh-mcp-connector')
     expect(warnings[1]?.textContent).toContain('stale-plugin')
     expect(document.querySelectorAll('[data-dsh-restart-failure]')).toHaveLength(0)
-    expect(restartButton().disabled).toBe(false)
-    expect(ackWrap().hidden).toBe(true)
-    expect(noticeText()).toContain('2 条提示')
+    // 提示不拦重启：检查过了就直接发出重启。
+    await waitFor(() => calls.some((call) => call.url === '/dsh-restart/api/restart'))
+    dialog.close()
   })
 
   it('标题和主按钮都叫「重启」，没有那句「最危险」小字', async () => {
@@ -569,11 +581,12 @@ describe('mountDialog：五段与状态', () => {
 
     expect(textOf('.dsh-restart-title')).toBe('重启')
     expect(restartButton().textContent).toBe('重启')
+    expect(document.querySelector('[data-dsh-restart-precheck]')).toBeNull()
     expect(document.body.textContent).not.toContain('最危险')
     expect(document.body.textContent).not.toContain('本次检查为准')
   })
 
-  it('预检判红时给勾选框：勾上才点亮重启，不再弹 confirm', async () => {
+  it('判红后勾上「跳过检查」再点：直接重启，不再跑预检', async () => {
     const lines = [
       JSON.stringify({ stage: 'config', ok: false, failures: [{ kind: 'config', message: 'dump-config 挂了' }] }),
       JSON.stringify({ stage: 'compat', ok: true, failures: [] }),
@@ -586,62 +599,101 @@ describe('mountDialog：五段与状态', () => {
       '/dsh-restart/api/precheck': ndjsonResponse(lines),
       '/dsh-restart/api/restart': jsonResponse({ ok: true, at: '2026-11-23T04:00:01.000Z', port: 3080 }, 202),
     })
-    const dialog = mountDialog(document, { fetchImpl })
+    const dialog = mountDialog(document, { fetchImpl, pollIntervalMs: 5000 })
     dialog.open()
     await settle()
-    precheckButton().click()
-    await waitFor(() => precheckButton().disabled === false)
+    restartButton().click()
+    await waitFor(() => noticeText().includes('预检没通过'))
     expect(document.querySelectorAll('[data-dsh-restart-failure]')).toHaveLength(1)
 
-    // 判红：勾选框露出来，按钮还是暗的。
-    expect(ackWrap().hidden).toBe(false)
-    expect(restartButton().disabled).toBe(true)
+    // 判红：勾选框本来就是常显的、没被自动勾上；重启请求一次都没发。
+    expect(ackInput().checked).toBe(false)
     expect(calls.some((call) => call.url === '/dsh-restart/api/restart')).toBe(false)
 
-    // 勾上就点亮，点了直接重启：中间不再有 confirm()。
     ackInput().click()
     expect(ackInput().checked).toBe(true)
-    expect(restartButton().disabled).toBe(false)
     restartButton().click()
     await settle()
+    // 勾上就跳过预检：precheck 仍是 1 次，restart 发了 1 次。
+    expect(calls.filter((call) => call.url === '/dsh-restart/api/precheck')).toHaveLength(1)
     const restartCall = calls.find((call) => call.url === '/dsh-restart/api/restart')
     expect(restartCall?.init.method).toBe('POST')
     expect(restartCall?.init.headers?.['x-dsh-restart']).toBe('1')
+    dialog.close()
   })
 
-  it('勾上再取消勾选，重启按钮重新变暗', async () => {
+  it('勾上再取消：下一次点击重新预检', async () => {
     const lines = [
       JSON.stringify({ stage: 'config', ok: false, failures: [{ kind: 'config', message: 'dump-config 挂了' }] }),
       JSON.stringify({ stage: 'compat', ok: true, failures: [] }),
       JSON.stringify({ stage: 'boot', ok: true, failures: [], entries: [], added: [], health: true }),
       JSON.stringify({ done: true }),
     ].join('\n') + '\n'
-    const { fetchImpl } = fakeFetch({
+    const { calls, fetchImpl } = fakeFetch({
       '/dsh-restart/api/status': jsonResponse(statusPayload()),
       '/dsh-restart/api/precheck': ndjsonResponse(lines),
     })
     const dialog = mountDialog(document, { fetchImpl })
     dialog.open()
     await settle()
-    precheckButton().click()
-    await waitFor(() => precheckButton().disabled === false)
+    restartButton().click()
+    await waitFor(() => noticeText().includes('预检没通过'))
 
     ackInput().click()
-    expect(restartButton().disabled).toBe(false)
+    expect(ackInput().checked).toBe(true)
     ackInput().click()
-    expect(restartButton().disabled).toBe(true)
+    expect(ackInput().checked).toBe(false)
+    expect(restartButton().disabled).toBe(false)
+
+    restartButton().click()
+    await waitFor(() => calls.filter((call) => call.url === '/dsh-restart/api/precheck').length === 2)
+  })
+
+  it('勾上跳过检查：只发 restart，不发 precheck', async () => {
+    const { calls, fetchImpl } = fakeFetch({
+      '/dsh-restart/api/status': jsonResponse(statusPayload({ last: {} })),
+      '/dsh-restart/api/restart': jsonResponse({ ok: true, at: '2026-11-23T04:00:01.000Z', port: 3080 }, 202),
+    })
+    const dialog = mountDialog(document, { fetchImpl, pollIntervalMs: 40, timeoutMs: 2000, reload: () => {} })
+    dialog.open()
+    await settle()
+
+    ackInput().click()
+    expect(ackInput().checked).toBe(true)
+    restartButton().click()
+    await waitFor(() => calls.some((call) => call.url === '/dsh-restart/api/restart'))
+    expect(calls.some((call) => call.url === '/dsh-restart/api/precheck')).toBe(false)
+    dialog.close()
+  })
+
+  it('restart 回 409：解锁但提示清楚，不补发', async () => {
+    const { calls, fetchImpl } = fakeFetch({
+      '/dsh-restart/api/status': jsonResponse(statusPayload({ last: {} })),
+      '/dsh-restart/api/restart': jsonResponse({ error: '已经有一个重启在进行中' }, 409),
+    })
+    const dialog = mountDialog(document, { fetchImpl })
+    dialog.open()
+    await settle()
+
+    ackInput().click()
+    restartButton().click()
+    await waitFor(() => noticeText().includes('已经有一个重启在进行中'))
+    expect(restartButton().disabled).toBe(false)
+    expect(ackInput().disabled).toBe(false)
+    expect(calls.filter((call) => call.url === '/dsh-restart/api/restart')).toHaveLength(1)
+    expect(calls.some((call) => call.url === '/dsh-restart/api/precheck')).toBe(false)
   })
 
   /* ---- 评审 C1/M1/M2 的回归用例 ---- */
 
-  it('上次通过 + 本次失败：重启按钮必须保持禁用（C1）', async () => {
+  it('上次通过 + 本次判红：不会自动重启（C1）', async () => {
     const failing = [
       JSON.stringify({ stage: 'config', ok: true, failures: [] }),
       JSON.stringify({ stage: 'compat', ok: false, failures: [{ kind: 'compat', message: '插件版本不满足' }] }),
       JSON.stringify({ stage: 'boot', ok: true, failures: [], entries: [], added: [], health: true }),
       JSON.stringify({ done: true }),
     ].join('\n') + '\n'
-    const { fetchImpl } = fakeFetch({
+    const { calls, fetchImpl } = fakeFetch({
       '/dsh-restart/api/status': jsonResponse(statusPayload({
         last: { precheck: { at: '2026-11-23T03:00:00.000Z', ok: true, fingerprint: 'fp-1', failures: [], durationMs: 1200 } },
       })),
@@ -649,17 +701,16 @@ describe('mountDialog：五段与状态', () => {
     })
     const dialog = mountDialog(document, { fetchImpl })
     dialog.open()
+    await settle()
+    expect(restartButton().disabled).toBe(false)
 
-    // 起点：上次通过，按钮可用（这是允许的，刷新页面不用重检）。
-    await waitFor(() => restartButton().disabled === false)
+    restartButton().click()
+    await waitFor(() => noticeText().includes('预检没通过'))
 
-    precheckButton().click()
-    await waitFor(() => precheckButton().disabled === false)
-
-    // 本轮判红之后，上一次的「通过」不能再放行。
+    // 本轮判红：不发重启，勾选框也不会被自动勾上。
     expect(textOf('[data-dsh-restart-stage="compat"]')).toContain('未通过')
-    expect(restartButton().disabled).toBe(true)
-    expect(ackWrap().hidden).toBe(false)
+    expect(calls.some((call) => call.url === '/dsh-restart/api/restart')).toBe(false)
+    expect(ackInput().checked).toBe(false)
   })
 
   it('检查中关掉弹窗：在飞请求被 abort、流被 cancel（M1）', async () => {
@@ -670,9 +721,9 @@ describe('mountDialog：五段与状态', () => {
     })
     const dialog = mountDialog(document, { fetchImpl })
     dialog.open()
-    await waitFor(() => precheckButton().disabled === false)
+    await settle()
 
-    precheckButton().click()
+    restartButton().click()
     await waitFor(() => state.reads > 0)
     const precheckCall = calls.find((call) => call.url === '/dsh-restart/api/precheck')
     expect(precheckCall?.init.signal?.aborted).toBe(false)
@@ -709,9 +760,7 @@ describe('mountDialog：五段与状态', () => {
       reload: () => {},
     })
     dialog.open()
-    await waitFor(() => precheckButton().disabled === false)
-    precheckButton().click()
-    await waitFor(() => restartButton().disabled === false)
+    await settle()
     restartButton().click()
 
     await waitFor(() => statusCalls >= 2)
@@ -750,9 +799,7 @@ describe('mountDialog：五段与状态', () => {
       },
     })
     dialog.open()
-    await waitFor(() => precheckButton().disabled === false)
-    precheckButton().click()
-    await waitFor(() => restartButton().disabled === false)
+    await settle()
     restartButton().click()
 
     await waitFor(() => reloads === 1)
@@ -762,18 +809,18 @@ describe('mountDialog：五段与状态', () => {
 
   it('NDJSON 每条 stage 到达就渲染，不等整包（M3）', async () => {
     const stream = manualNdjson()
-    const { fetchImpl } = fakeFetch({
+    const { calls, fetchImpl } = fakeFetch({
       '/dsh-restart/api/status': jsonResponse(statusPayload({ last: {} })),
       '/dsh-restart/api/precheck': stream.response,
     })
     const dialog = mountDialog(document, { fetchImpl })
     dialog.open()
-    await waitFor(() => precheckButton().disabled === false)
-    precheckButton().click()
+    await settle()
+    restartButton().click()
 
     stream.push(JSON.stringify({ stage: 'config', ok: true, failures: [] }) + '\n')
     await waitFor(() => textOf('[data-dsh-restart-stage="config"]').includes('通过'))
-    // done 还没来：不能提前宣布全过。
+    // done 还没来：不能提前宣布全过，检查中按钮锁住。
     expect(textOf('[data-dsh-restart-stage="compat"]')).toContain('未检查')
     expect(restartButton().disabled).toBe(true)
 
@@ -781,7 +828,7 @@ describe('mountDialog：五段与状态', () => {
     stream.push(JSON.stringify({ stage: 'boot', ok: true, failures: [], entries: [], added: [], health: true }) + '\n')
     stream.push(JSON.stringify({ done: true }) + '\n')
     stream.finish()
-    await waitFor(() => restartButton().disabled === false)
+    await waitFor(() => calls.some((call) => call.url === '/dsh-restart/api/restart'))
   })
 
   it('最后一包多行与 done 同块、且没有结尾换行，也不丢行（m1）', async () => {
@@ -810,16 +857,16 @@ describe('mountDialog：五段与状态', () => {
         },
       },
     }
-    const { fetchImpl } = fakeFetch({
+    const { calls, fetchImpl } = fakeFetch({
       '/dsh-restart/api/status': jsonResponse(statusPayload({ last: {} })),
       '/dsh-restart/api/precheck': response,
     })
     const dialog = mountDialog(document, { fetchImpl })
     dialog.open()
-    await waitFor(() => precheckButton().disabled === false)
-    precheckButton().click()
+    await settle()
+    restartButton().click()
 
-    await waitFor(() => precheckButton().disabled === false && restartButton().disabled === false)
+    await waitFor(() => calls.some((call) => call.url === '/dsh-restart/api/restart'))
     expect(textOf('[data-dsh-restart-stage="boot"]')).toContain('通过')
   })
 })
