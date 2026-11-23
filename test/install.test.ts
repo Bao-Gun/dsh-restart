@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -208,6 +208,16 @@ describe('仓库产物校验', () => {
     const report = await install.validateRepo(repo)
     expect(report.ok).toBe(false)
   })
+
+  it('产物是 0 字节时失败并指出空文件', async () => {
+    const install = await loadInstall()
+    const repo = await makeRepo()
+    await writeFile(join(repo, 'lib', 'client.js'), '')
+    const report = await install.validateRepo(repo)
+    expect(report.ok).toBe(false)
+    const failed = report.checks.find((check: any) => check.name === '构建产物 lib/client.js')
+    expect(failed.detail).toContain('0 bytes')
+  })
 })
 
 describe('计划与应用', () => {
@@ -229,10 +239,10 @@ describe('计划与应用', () => {
     expect(await linkEntryExists(linkPath)).toBe(true)
 
     const text = install.formatPlan(plan)
-    expect(text).toContain('[add]')
-    expect(text).toContain('[append]')
-    expect(text).toContain('[install]')
-    expect(text).toContain('[remove]')
+    expect(text).toContain('[dependency:add]')
+    expect(text).toContain('[patch:append]')
+    expect(text).toContain('[link:install]')
+    expect(text).toContain('[link:remove]')
     expect(text).toContain('dry-run')
   })
 
@@ -279,6 +289,112 @@ describe('计划与应用', () => {
   })
 })
 
+describe('patch 条目的宽松识别', () => {
+  it('同 id 不同 name 视为已安装，但在计划里告警', async () => {
+    const install = await loadInstall()
+    const repo = await makeRepo()
+    const profile = await makeProfile({ patch: '- insert:\n    - id: restart-button\n      name: some-other-plugin\n' })
+    const plan = await install.buildPlan({ repoDir: repo, profileDir: profile })
+    expect(plan.patch.kind).toBe('patch:skip')
+    expect(install.hasPatchEntry('- insert:\n    - id: restart-button\n      name: some-other-plugin\n')).toBe(true)
+    expect(plan.warnings.join(' ')).toContain('name 不是 dsh-restart')
+  })
+})
+
+describe('安装失败态：顺序与自愈提示', () => {
+  it('patch 只读：依赖与软链已写、patch 原样、报错说明已完成步骤', async () => {
+    const install = await loadInstall()
+    const repo = await makeRepo()
+    const profile = await makeProfile({ patch: '- id: web\n  name: dsh-web\n' })
+    const patchPath = join(profile, 'cordis.patch.yml')
+    const patchBefore = await readFile(patchPath, 'utf8')
+    await chmod(patchPath, 0o444)
+    try {
+      const plan = await install.buildPlan({ repoDir: repo, profileDir: profile })
+      await expect(install.applyPlan(plan)).rejects.toThrow(/安装中途失败[\s\S]*重跑本脚本即可自愈/)
+    } finally {
+      await chmod(patchPath, 0o644)
+    }
+    const pkg = JSON.parse(await readFile(join(profile, 'package.json'), 'utf8'))
+    expect(pkg.dependencies['dsh-restart']).toBe('link:' + repo)
+    expect(await readFile(patchPath, 'utf8')).toBe(patchBefore)
+    expect((await lstat(join(profile, 'node_modules', 'dsh-restart'))).isSymbolicLink()).toBe(true)
+  })
+
+  it('node_modules 只读：依赖已写、软链与 patch 都未完成', async () => {
+    const install = await loadInstall()
+    const repo = await makeRepo()
+    const profile = await makeProfile({ patch: '- id: web\n  name: dsh-web\n' })
+    const patchPath = join(profile, 'cordis.patch.yml')
+    const patchBefore = await readFile(patchPath, 'utf8')
+    const modules = join(profile, 'node_modules')
+    await chmod(modules, 0o555)
+    try {
+      const plan = await install.buildPlan({ repoDir: repo, profileDir: profile })
+      await expect(install.applyPlan(plan)).rejects.toThrow(/安装中途失败[\s\S]*软链/)
+    } finally {
+      await chmod(modules, 0o755)
+    }
+    const pkg = JSON.parse(await readFile(join(profile, 'package.json'), 'utf8'))
+    expect(pkg.dependencies['dsh-restart']).toBe('link:' + repo)
+    expect(await readFile(patchPath, 'utf8')).toBe(patchBefore)
+    expect(await linkEntryExists(join(modules, 'dsh-restart'))).toBe(false)
+  })
+
+  it('--apply 文案是「将写入」，不再声称 dry-run 未写文件', async () => {
+    const install = await loadInstall()
+    const repo = await makeRepo()
+    const profile = await makeProfile({ patch: '- id: web\n  name: dsh-web\n' })
+    const plan = await install.buildPlan({ repoDir: repo, profileDir: profile })
+    const applyText = install.formatPlan(plan, 'apply')
+    expect(applyText).toContain('将写入')
+    expect(applyText).toContain('patch 最后写')
+    expect(applyText).not.toContain('dry-run 未写任何文件')
+    const verifyText = install.formatPlan(plan, 'verify')
+    expect(verifyText).toContain('只写克隆')
+    expect(verifyText).toContain('真实 profile 只读')
+  })
+})
+
+describe('--verify 纯逻辑', () => {
+  it('cloneArgs 在 macOS 用 clonefile，其它平台用普通 -R', async () => {
+    const install = await loadInstall()
+    expect(install.cloneArgs('/a', '/b', 'darwin')).toEqual(['-c', '-R', '/a', '/b'])
+    expect(install.cloneArgs('/a', '/b', 'linux')).toEqual(['-R', '/a', '/b'])
+  })
+
+  it('launchArgs 固定 port 0（不碰 3080）且 no-open', async () => {
+    const install = await loadInstall()
+    expect(install.launchArgs()).toEqual(['--profile', 'web', '--port', '0', '--no-open'])
+    expect(install.launchArgs({ profileName: 'dev', port: 1234 })).toEqual(['--profile', 'dev', '--port', '1234', '--no-open'])
+  })
+
+  it('清理顺序：先杀进程组，再删临时目录', async () => {
+    const install = await loadInstall()
+    expect(install.cleanupSequence()).toEqual(['kill-process-group', 'remove-temp-dir'])
+    expect(install.VERIFY_DIR_PREFIX).toBe('dsh-restart-verify-')
+  })
+
+  it('syncLockfile 把目录/超时传给 runner 并记录耗时，失败原样带出 reason', async () => {
+    const install = await loadInstall()
+    const calls: any[] = []
+    const ok = install.syncLockfile({
+      profileDir: '/tmp/profile',
+      run: (dir: string, timeoutMs: number) => {
+        calls.push([dir, timeoutMs])
+        return { ok: true, output: 'Done' }
+      },
+    })
+    expect(calls).toEqual([['/tmp/profile', 20000]])
+    expect(ok.ok).toBe(true)
+    expect(typeof ok.elapsedMs).toBe('number')
+
+    const failed = install.syncLockfile({ profileDir: '/tmp/profile', timeoutMs: 500, run: () => ({ ok: false, reason: '超时 500ms' }) })
+    expect(failed.ok).toBe(false)
+    expect(failed.reason).toBe('超时 500ms')
+  })
+})
+
 describe('CLI', () => {
   it('默认 dry-run：输出计划、退出 0、不写文件、不动软链', async () => {
     const repo = await makeRepo()
@@ -290,7 +406,7 @@ describe('CLI', () => {
       encoding: 'utf8',
     })
     expect(result.status).toBe(0)
-    expect(result.stdout).toContain('[add]')
+    expect(result.stdout).toContain('[dependency:add]')
     expect(result.stdout).toContain('dry-run')
     expect(await readFile(join(profile, 'package.json'), 'utf8')).toBe(pkgBefore)
     expect(await linkEntryExists(linkPath)).toBe(true)

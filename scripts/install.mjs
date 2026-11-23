@@ -3,7 +3,7 @@
  * dsh-restart 安装脚本：把本仓库链进 DSH web profile，并让 profile 的 cordis patch 认领它。
  *
  * 默认 dry-run：只读 profile，打印将要做的每一项改动；加 --apply 才写。
- * --verify：在 `cp -c` 克隆出来的临时 DSH_HOME 里重做一遍安装，另起一个 port=0 的实例，
+ * --verify：在克隆出来的临时 DSH_HOME 里重做一遍安装（macOS 用 cp -c，其它平台或失败回退 cp -R），另起一个 port=0 的实例，
  *          探到 /health 200 且 /dsh-restart/api/status 200 才算通过，随后回收进程组、删除临时目录。
  *
  * 只使用 node: 内置模块，不引入第三方依赖，也不参与 tsc。
@@ -99,37 +99,47 @@ export function planDependency(packageText, linkTarget) {
   }
 }
 
-/** 只认 cordis patch 的 insert 列表；顶层 "- id: restart-button" 对不存在的条目只会告警，不算安装。 */
-export function hasPatchEntry(patchText) {
+/**
+ * 只认 cordis patch 的 insert 列表；顶层 "- id: restart-button" 对不存在的条目只会告警，不算安装。
+ * 判定以 id 为准：同 id 的手工条目即使把 name 改成别名也算已安装（避免重复 id），由调用方告警。
+ */
+export function inspectPatchEntry(patchText) {
   const lines = String(patchText).split(/\r?\n/)
   let inInsert = false
   let sawId = false
-  let sawName = false
+  let sawExpectedName = false
   const finishBlock = () => {
-    const matched = inInsert && sawId && sawName
+    const matched = inInsert && sawId
+    const result = matched ? { present: true, nameMatches: sawExpectedName } : null
     inInsert = false
     sawId = false
-    sawName = false
-    return matched
+    sawExpectedName = false
+    return result
   }
   for (const line of lines) {
     if (/^-\s+insert:\s*$/.test(line)) {
-      if (finishBlock()) return true
+      const done = finishBlock()
+      if (done) return done
       inInsert = true
       continue
     }
     if (line.trim() !== '' && /^\S/.test(line)) {
-      if (finishBlock()) return true
+      const done = finishBlock()
+      if (done) return done
       continue
     }
     if (!inInsert) continue
     if (/^\s+-\s+id:\s*['"]?restart-button['"]?\s*$/.test(line)) sawId = true
-    else if (/^\s+name:\s*['"]?dsh-restart['"]?\s*$/.test(line)) sawName = true
+    else if (/^\s+name:\s*['"]?dsh-restart['"]?\s*$/.test(line)) sawExpectedName = true
   }
-  return finishBlock()
+  return finishBlock() ?? { present: false, nameMatches: false }
 }
 
-/** 幂等追加：已有同 id+name 的 insert 块时原样返回。 */
+export function hasPatchEntry(patchText) {
+  return inspectPatchEntry(patchText).present
+}
+
+/** 幂等追加：已有同 id 的 insert 块时原样返回。 */
 export function appendPatchEntry(patchText, snippet) {
   const text = String(patchText)
   const block = String(snippet).trim()
@@ -185,10 +195,11 @@ export async function validateRepo(repoDir = REPO_DIR) {
   for (const relative of REQUIRED_ARTIFACTS) {
     const path = join(repoDir, relative)
     const info = await stat(path).catch(() => null)
+    const ok = Boolean(info && info.isFile() && info.size > 0)
     checks.push({
       name: `构建产物 ${relative}`,
-      ok: Boolean(info && info.isFile()),
-      detail: info && info.isFile() ? `${info.size} bytes` : '缺失',
+      ok,
+      detail: info && info.isFile() ? `${info.size} bytes${info.size > 0 ? '' : '（空文件，通常是构建失败残留）'}` : '缺失',
     })
   }
   let pkg = null
@@ -222,6 +233,7 @@ export async function buildPlan({ repoDir = REPO_DIR, profileDir = DEFAULT_PROFI
   const linkTarget = `link:${repoDir}`
 
   const dependency = planDependency(packageText, linkTarget)
+  const patchInspect = inspectPatchEntry(patchText)
   const appended = appendPatchEntry(patchText, snippet)
   const patch = { kind: appended.changed ? 'patch:append' : 'patch:skip', ...appended }
   const pluginLink = await planPluginLink(profileDir, repoDir)
@@ -271,6 +283,9 @@ export async function buildPlan({ repoDir = REPO_DIR, profileDir = DEFAULT_PROFI
   const warnings = []
   if (!validation.ok) warnings.push('仓库校验未通过：修复构建产物 / dsh.client 后再 --apply')
   if (pluginLink.kind === 'blocked') warnings.push(`node_modules/${PLUGIN_NAME} 是真实${pluginLink.reason === 'real-directory' ? '目录' : '文件'}，脚本不会覆盖`)
+  if (patchInspect.present && !patchInspect.nameMatches) {
+    warnings.push(`已有 id: ${PLUGIN_ID} 的 insert 块但 name 不是 ${PLUGIN_NAME}，按已安装处理；若不是手工改过，请检查 cordis.patch.yml`)
+  }
 
   return {
     repoDir,
@@ -295,58 +310,90 @@ export async function buildPlan({ repoDir = REPO_DIR, profileDir = DEFAULT_PROFI
   }
 }
 
-export function formatPlan(plan) {
+export function formatPlan(plan, mode = 'dry-run') {
+  const apply = mode === 'apply'
+  const verify = mode === 'verify'
   const lines = []
-  lines.push('dsh-restart 安装计划（dry-run）')
+  lines.push(`dsh-restart 安装计划（${apply ? '--apply，将写入' : verify ? '--verify，真实 profile 只读' : 'dry-run'}）`)
   lines.push(`仓库: ${plan.repoDir}`)
   lines.push(`profile: ${plan.profileDir}`)
   lines.push(`链接目标: ${plan.linkTarget}`)
-  lines.push('改动:')
+  lines.push(apply ? '将写入:' : '改动:')
   for (const action of plan.actions) {
-    lines.push(`  [${action.kind.split(':')[1]}] ${action.target}: ${action.detail}`)
+    lines.push(`  [${action.kind}] ${action.target}: ${action.detail}`)
   }
   lines.push('校验（安装前）:')
   for (const check of plan.validation.checks) {
     lines.push(`  ${check.ok ? '✓' : '✗'} ${check.name}: ${check.detail}`)
   }
   for (const warning of plan.warnings) lines.push(`! ${warning}`)
+  const count = plan.actions.filter((action) => !action.kind.endsWith(':skip') && !action.kind.endsWith(':none')).length
   if (plan.pluginLink.kind === 'blocked') {
-    lines.push('结论: 有阻塞项（真实目录/文件挡路），--apply 会拒绝执行；dry-run 未写任何文件。')
+    lines.push('结论: 有阻塞项（真实目录/文件挡路），--apply 会拒绝执行；未写任何文件。')
   } else if (plan.changed) {
-    const count = plan.actions.filter((action) => !action.kind.endsWith(':skip') && !action.kind.endsWith(':none')).length
-    lines.push(`结论: ${count} 项待改动；dry-run 未写任何文件，加 --apply 执行。`)
+    if (apply) lines.push(`结论: ${count} 项将写入 profile（下列顺序执行，patch 最后写）。`)
+    else if (verify) lines.push(`结论: 真实 profile 有 ${count} 项待改动，本次 --verify 只写克隆、不动真实 profile。`)
+    else lines.push(`结论: ${count} 项待改动；dry-run 未写任何文件，加 --apply 执行。`)
   } else {
-    lines.push('结论: 全部已一致，无需改动（幂等检查通过）；dry-run 未写任何文件。')
+    lines.push(`结论: 全部已一致，无需改动（幂等检查通过）${apply ? '，未写任何文件。' : verify ? '；真实 profile 未改动。' : '；dry-run 未写任何文件。'}`)
   }
   return lines.join('\n')
 }
 
-/** 真正写盘。只应由 CLI 在 --apply 且校验通过后调用。 */
+/**
+ * 真正写盘。只应由 CLI 在 --apply 且校验通过后调用。
+ * 顺序有意为之：patch 最后写。最坏失败态是「依赖已声明、软链已建、但配置还没认领」，
+ * 此时没有任何代码引用插件，dsh web 照常启动；反过来（配置认领了不存在的包）会留一个静默失效的条目。
+ */
 export async function applyPlan(plan) {
   if (!plan.validation.ok) throw new InstallError('仓库校验未通过，拒绝写入 profile')
   if (plan.pluginLink.kind === 'blocked') {
     throw new InstallError(`node_modules/${PLUGIN_NAME} 是真实${plan.pluginLink.reason === 'real-directory' ? '目录' : '文件'}，拒绝覆盖：${plan.pluginLink.path}`)
   }
+  const table = []
   const applied = []
-  if (plan.dependency.kind !== 'skip') {
+  const run = async (label, skip, fn) => {
+    if (skip) {
+      table.push(`- ${label}: 已一致，跳过`)
+      return
+    }
+    try {
+      const note = await fn()
+      table.push(`✓ ${label}${note ? `：${note}` : ''}`)
+      applied.push(note ?? label)
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      table.push(`✗ ${label}：${reason}`)
+      const message = [
+        '安装中途失败，已停止。',
+        '步骤:',
+        ...table.map((row) => `  ${row}`),
+        `已完成: ${applied.length ? applied.join('；') : '无'}`,
+        '重跑本脚本即可自愈（幂等：已完成的步骤会跳过或覆盖为一致状态）。',
+      ]
+      throw new InstallError(message.join('\n'))
+    }
+  }
+
+  await run('package.json 依赖', plan.dependency.kind === 'skip', async () => {
     await writeFile(plan.profilePackagePath, plan.dependency.nextText)
-    applied.push(`package.json: ${plan.dependency.kind} ${PLUGIN_NAME}`)
-  }
-  if (plan.patch.changed) {
-    await writeFile(plan.patchPath, plan.patch.text)
-    applied.push('cordis.patch.yml: 追加 insert 块')
-  }
-  if (plan.pluginLink.kind === 'install') {
+    return `${plan.dependency.kind} ${PLUGIN_NAME}`
+  })
+  await run(`删除悬空软链 ${LEGACY_LINK_NAME}`, plan.link.kind !== 'remove', async () => {
+    await rm(plan.link.path, { force: true })
+    return `删除 ${LEGACY_LINK_NAME}`
+  })
+  await run(`node_modules/${PLUGIN_NAME} 软链`, plan.pluginLink.kind !== 'install', async () => {
     await mkdir(dirname(plan.pluginLink.path), { recursive: true })
     await rm(plan.pluginLink.path, { force: true })
     await symlink(plan.repoDir, plan.pluginLink.path, 'dir')
-    applied.push(`node_modules/${PLUGIN_NAME}: 建软链`)
-  }
-  if (plan.link.kind === 'remove') {
-    await rm(plan.link.path, { force: true })
-    applied.push(`删除悬空软链 ${LEGACY_LINK_NAME}`)
-  }
-  return { changed: applied.length > 0, applied }
+    return `-> ${plan.repoDir}`
+  })
+  await run('cordis.patch.yml', !plan.patch.changed, async () => {
+    await writeFile(plan.patchPath, plan.patch.text)
+    return '追加 insert 块'
+  })
+  return { changed: applied.length > 0, applied, steps: table }
 }
 
 /** 在副本里重做安装：写依赖、追加 patch、建 link（不跑 pnpm，避免网络与脚本）。 */
@@ -367,6 +414,51 @@ async function installIntoCopy(profileCopy, repoDir) {
 
   const dangling = await planDanglingLink(profileCopy)
   if (dangling.kind === 'remove') await rm(dangling.path, { force: true })
+}
+
+export const VERIFY_DIR_PREFIX = 'dsh-restart-verify-'
+
+/** 克隆参数：macOS 用 APFS clonefile（-c），其它平台普通 -R；--verify 会打印实际用的形态。 */
+export function cloneArgs(source, dest, platform = process.platform) {
+  return platform === 'darwin' ? ['-c', '-R', source, dest] : ['-R', source, dest]
+}
+
+/** 独立实例的启动参数：端口 0 由宿主分配，绝不碰已有的 3080。 */
+export function launchArgs({ profileName = 'web', port = 0 } = {}) {
+  return ['--profile', profileName, '--port', String(port), '--no-open']
+}
+
+/** 清理顺序固定：先回收进程组，再删临时目录（反过来会来不及读实例日志）。 */
+export function cleanupSequence() {
+  return ['kill-process-group', 'remove-temp-dir']
+}
+
+/** 只同步 profile 的 pnpm-lock.yaml，不碰 node_modules；失败/超时只告警，不算安装失败。 */
+export function syncLockfile({ profileDir = DEFAULT_PROFILE_DIR, timeoutMs = 20000, run = runPnpmLockfileOnly } = {}) {
+  const started = Date.now()
+  const result = run(profileDir, timeoutMs)
+  return { ...result, elapsedMs: Date.now() - started }
+}
+
+function runPnpmLockfileOnly(profileDir, timeoutMs) {
+  const result = spawnSync('pnpm', ['install', '--offline', '--ignore-scripts', '--lockfile-only'], {
+    cwd: profileDir,
+    encoding: 'utf8',
+    timeout: timeoutMs,
+    env: { ...process.env, CI: '1' },
+  })
+  if (result.error) {
+    const timedOut = result.error.code === 'ETIMEDOUT' || result.signal === 'SIGTERM'
+    return {
+      ok: false,
+      reason: timedOut ? `超时 ${timeoutMs}ms` : result.error.message,
+      output: (result.stderr || '').slice(-400),
+    }
+  }
+  if (result.status !== 0) {
+    return { ok: false, reason: `exit ${result.status}`, output: (result.stderr || result.stdout || '').slice(-400) }
+  }
+  return { ok: true, output: (result.stdout || '').slice(-400) }
 }
 
 function waitForExit(child, timeoutMs) {
@@ -464,21 +556,27 @@ export async function runVerify({
   }
 
   try {
-    home = await mkdtemp(join(tmpdir(), 'dsh-restart-verify-'))
+    home = await mkdtemp(join(tmpdir(), VERIFY_DIR_PREFIX))
     const profilesDir = join(home, 'profiles')
     await mkdir(profilesDir, { recursive: true })
     const profileCopy = join(profilesDir, 'web')
-    const copied = spawnSync('cp', ['-c', '-R', profileDir, profileCopy], { encoding: 'utf8' })
-    if (copied.status !== 0) {
-      throw new InstallError(`cp -c 克隆 profile 失败: ${(copied.stderr || '').trim() || `exit ${copied.status}`}`)
+    let cloneLabel = process.platform === 'darwin' ? 'cp -c -R' : 'cp -R（非 macOS）'
+    let copied = spawnSync('cp', cloneArgs(profileDir, profileCopy), { encoding: 'utf8' })
+    if (copied.status !== 0 && process.platform === 'darwin') {
+      await rm(profileCopy, { recursive: true, force: true }).catch(() => {})
+      copied = spawnSync('cp', cloneArgs(profileDir, profileCopy, 'linux'), { encoding: 'utf8' })
+      cloneLabel = 'cp -R（clonefile 失败，已回退）'
     }
-    record('clone', true, `cp -c -R → ${profileCopy}`)
+    if (copied.status !== 0) {
+      throw new InstallError(`${cloneLabel} 克隆 profile 失败: ${(copied.stderr || '').trim() || `exit ${copied.status}`}`)
+    }
+    record('clone', true, `${cloneLabel} → ${profileCopy}`)
 
     await installIntoCopy(profileCopy, repoDir)
     record('install-copy', true, `副本内写依赖、追加 patch、link → ${repoDir}`)
 
     const dshBin = process.env.DSH_BIN || 'dsh'
-    child = spawn(dshBin, ['--profile', 'web', '--port', '0', '--no-open'], {
+    child = spawn(dshBin, launchArgs(), {
       cwd: home,
       env: { ...process.env, DSH_HOME: home, DSH_DAEMON_OPEN_BROWSER: '0' },
       detached: true,
@@ -562,8 +660,8 @@ function parseArgs(argv) {
 const HELP = `用法: node scripts/install.mjs [--profile <dir>] [--repo <dir>] [--apply] [--verify]
 
 默认 dry-run：只打印计划，不写任何文件。
-  --apply    真正写入 profile 的 package.json / cordis.patch.yml，并删除悬空软链
-  --verify   在 cp -c 克隆的临时 DSH_HOME 里起 port=0 实例，探 /health 与 status 200
+  --apply    真正写入 profile 的 package.json / cordis.patch.yml，并删除悬空软链；成功后补 pnpm --lockfile-only
+  --verify   在克隆的临时 DSH_HOME 里起 port=0 实例，探 /health 与 status 200（macOS 用 cp -c，其它回退 cp -R）
   --profile  默认 ~/.dsh/profiles/web
   --repo     默认本仓库根目录
 `
@@ -582,7 +680,7 @@ export async function main(argv = process.argv.slice(2), io = { out: console.log
   }
 
   const plan = await buildPlan({ repoDir: options.repoDir, profileDir: options.profileDir })
-  io.out(formatPlan(plan))
+  io.out(formatPlan(plan, options.apply ? 'apply' : options.verify ? 'verify' : 'dry-run'))
 
   if (!plan.validation.ok) {
     io.err('仓库校验未通过，停止。')
@@ -608,6 +706,15 @@ export async function main(argv = process.argv.slice(2), io = { out: console.log
   if (options.apply) {
     const applied = await applyPlan(plan)
     io.out(`已应用: ${applied.changed ? applied.applied.join('；') : '无改动（全部已一致）'}`)
+    if (plan.dependency.kind !== 'skip' && applied.changed) {
+      const lock = await syncLockfile({ profileDir: options.profileDir })
+      if (lock.ok) {
+        io.out(`✓ lockfile: pnpm install --lockfile-only 已同步（${lock.elapsedMs}ms）`)
+      } else {
+        io.out(`! lockfile 未同步（${lock.reason}）：不影响插件加载，但 pnpm install --frozen-lockfile 可能报 OUTDATED_LOCKFILE`)
+        io.out(`  可稍后在 profile 目录手动跑: pnpm install --offline --ignore-scripts --lockfile-only`)
+      }
+    }
     io.out('下一步: 重启 dsh web（或用 dsh_restart 工具）让 profile 重新加载。')
   } else if (options.verify) {
     io.out('（验证完成：真实 profile 未改动。确认后加 --apply。）')
