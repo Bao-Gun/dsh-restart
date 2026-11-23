@@ -232,6 +232,15 @@ describe('顶层 fingerprint 契约', () => {
     expect(isStale(await readLast(dir), '0123456789abcdef')).toBe(false)
   })
 
+  it('只写 precheck 且没显式给 fingerprint 时，顶层自动对齐成 precheck.fingerprint', async () => {
+    // 全新记录：调用方忘传顶层指纹，也不能让 isStale 永远为 true（按钮灰禁死锁）
+    await writeLast(dir, { precheck: precheck('0123456789abcdef') })
+
+    const record = await readLast(dir)
+    expect(record.fingerprint).toBe('0123456789abcdef')
+    expect(isStale(record, '0123456789abcdef')).toBe(false)
+  })
+
   it('只写 precheck 时保留已有的顶层 fingerprint，不抹掉', async () => {
     await writeLast(dir, { fingerprint: '0123456789abcdef' })
     await writeLast(dir, { precheck: precheck('0123456789abcdef') })

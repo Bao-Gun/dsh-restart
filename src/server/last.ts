@@ -133,8 +133,9 @@ function serializeWrite(task: () => Promise<void>): Promise<void> {
  * 合并写：只覆盖 patch 里显式给出的键，其余保留。先写同目录 .tmp 再 rename，读者不会看到半截文件；
  * 进程内的并发写由 `serializeWrite` 排队，不会互相丢键。
  *
- * 顶层 `fingerprint` 是 `isStale` 的唯一依据：patch 没显式给就保持原值（带 precheck 时也不会被抹掉），
- * 显式给了才更新。预检通过时要显式传 `fingerprint`（Task 6 的计划已写明）。
+ * 顶层 `fingerprint` 是 `isStale` 的唯一依据。写入优先级：patch 显式给了 `fingerprint` 就用它；
+ * 否则 patch 带 `precheck` 时自动对齐成 `precheck.fingerprint`（必填）；两者都没有就保持原值。
+ * 预检仍应显式传 `fingerprint`（Task 6 的计划这样写），不变量只是兜底。
  */
 export function writeLast(dir: string, patch: Partial<LastRecord>): Promise<void> {
   return serializeWrite(() => writeLastNow(dir, patch))
@@ -145,7 +146,12 @@ async function writeLastNow(dir: string, patch: Partial<LastRecord>): Promise<vo
 
   if (patch.fingerprint !== undefined) merged.fingerprint = patch.fingerprint
   if (patch.baseline !== undefined) merged.baseline = patch.baseline
-  if (patch.precheck !== undefined) merged.precheck = patch.precheck
+  if (patch.precheck !== undefined) {
+    merged.precheck = patch.precheck
+    // 不变量：落了一条预检结果，顶层指纹就对齐成它的指纹（该字段必填）。
+    // 调用方忘了显式传 fingerprint 也不会让 isStale 永远为 true、把按钮灰禁死。
+    if (patch.fingerprint === undefined) merged.fingerprint = patch.precheck.fingerprint
+  }
   if (patch.restart !== undefined) merged.restart = patch.restart
 
   await mkdir(dir, { recursive: true })
