@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { promisify } from 'node:util'
@@ -10,14 +10,16 @@ import type { Failure } from '../shared/types'
 /**
  * 预检 C：克隆当前 profile 到临时 DSH_HOME，另起一个 dsh web，等 /health，收未激活名单。
  *
- * 两个安全点：
+ * 三个安全点：
  * - 克隆必须用 APFS clonefile（cp -c）。硬链接会共享 inode，试跑写日志/auth 会写进线上 profile。
  * - 无论成功失败，finally 里都要杀掉整个进程组并删掉临时目录，不能留孤儿进程。
+ * - 组长（dsh 主进程）可能比同组 sidecar 先退出，所以组清理以「组里还有没有成员」为准，
+ *   不能以直接子进程退没退出来短路。
  */
 
 const execFileAsync = promisify(execFile)
 
-/** 实测克隆后首次启动约 5.2s，8s 太紧；12s 仍属 8 秒级，且给并发构建留余量。 */
+/** 轮询窗口 12s；总墙钟约 13s：克隆约 5s + 启动约 5s + SIGTERM 宽限 2s + 删两万多个文件。 */
 const DEFAULT_SMOKE_TIMEOUT_MS = 12_000
 const DUMP_CONFIG_TIMEOUT_MS = 20_000
 const CLONE_TIMEOUT_MS = 60_000
@@ -25,6 +27,12 @@ const COPY_TIMEOUT_MS = 120_000
 const HEALTH_POLL_INTERVAL_MS = 150
 const KILL_GRACE_MS = 2_000
 const KILL_KILL_GRACE_MS = 1_000
+const GROUP_POLL_INTERVAL_MS = 50
+/** 成功后再等输出静默一小段，避免漏掉 URL 之后才落盘的诊断行；上限 1s。 */
+const OUTPUT_QUIET_MS = 200
+const OUTPUT_SETTLE_CAP_MS = 1_000
+/** 组长先退出时，给 close 事件留的冲刷时间；sidecar 占着管道也不会无限等。 */
+const EXIT_FLUSH_MS = 200
 /** 告警在启动早期，留开头；截断只防异常输出撑爆内存。 */
 const STDERR_LIMIT = 256 * 1024
 const STDOUT_LIMIT = 64 * 1024
@@ -34,11 +42,16 @@ const HEALTH_PROBE_TIMEOUT_MS = 1_500
 const WEB_URL_LINE = /dsh web:\s+(https?:\/\/[^\s]+)/
 
 const ACTIVATION_MARKER = 'did not activate'
+const OPTIONAL_HEADER = /entries did not activate/
 /** 可选条目告警：<entry id> (<package>): <detail> */
 const DIAGNOSTIC_LINE = /^(\S+) \(([^()]*)\): /
 /** 必需条目失败块：两空格缩进的 id，下一行才是 Package。 */
 const STARTUP_FAILED_LINE = /^ {2}(\S+?)(?: \(required\))?$/
 const STARTUP_PACKAGE_LINE = /^ {4}Package: /
+
+const SMOKE_DIR_PREFIX = 'dsh-smoke-'
+const RUN_PID_FILE = 'run.pid'
+const DSH_PID_FILE = 'dsh.pid'
 
 export interface SmokeOptions {
   profileDir: string
@@ -48,9 +61,12 @@ export interface SmokeOptions {
 }
 
 export interface SmokeResult {
-  /** 只表示 /health 200；是否「通过」要由调用方结合基线差分判断。 */
+  /**
+   * 只表示试跑实例的 /health 200，不包含清理结果。
+   * 调用方必须同时要求 failures 为空、diffFailedEntries(本次, 基线) 的 added 为空，才算通过。
+   */
   ok: boolean
-  /** 启动失败、克隆失败这类硬失败；未激活名单不算失败。 */
+  /** 启动失败、克隆失败、清理失败这类硬失败；未激活名单不算失败。 */
   failures: Failure[]
   /** stderr 里本次未激活的条目 id，交给 diffFailedEntries 比基线。 */
   failedEntries: string[]
@@ -63,6 +79,12 @@ interface CommandOutcome {
   stderr: string
   timedOut: boolean
   spawnError: string | null
+}
+
+interface WebUrlProbe {
+  port: number | null
+  /** 打印了 dsh web: URL 但取不到本地监听端口（如 public-url 形态）。 */
+  urlWithoutPort: string | null
 }
 
 function messageOf(error: unknown): string {
@@ -85,6 +107,11 @@ function describeCommand(outcome: CommandOutcome): string {
   if (outcome.timedOut) return '超时'
   const detail = tail(outcome.stderr)
   return '退出码 ' + String(outcome.code) + (detail === '' ? '' : '：' + detail)
+}
+
+/** 快检 A 与冒烟共用同一个二进制入口，避免一套 PATH 下快检 A 失败、冒烟却正常。 */
+function resolveDshBin(): string {
+  return process.env.DSH_RESTART_DSH_BIN ?? 'dsh'
 }
 
 /** 跑一个会自己退出的命令（cp / dump-config），超时会杀掉它。 */
@@ -120,16 +147,180 @@ async function runCommand(
   }
 }
 
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+function groupAlive(pid: number): boolean {
+  if (process.platform === 'win32') return false
+  try {
+    process.kill(-pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+async function waitForGroupGone(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (!groupAlive(pid)) return true
+    await delay(GROUP_POLL_INTERVAL_MS)
+  }
+  return !groupAlive(pid)
+}
+
+/**
+ * 按进程组清理：先 SIGTERM，轮询到组空；还在就 SIGKILL。
+ * 组长已经退出但组员还活着时，kill(-pid) 依然有效，所以不能看 child.exitCode 短路。
+ */
+async function terminateGroup(pid: number, graceMs: number, killGraceMs: number): Promise<boolean> {
+  if (!groupAlive(pid)) return true
+  try {
+    process.kill(-pid, 'SIGTERM')
+  } catch {
+    return !groupAlive(pid)
+  }
+  if (await waitForGroupGone(pid, graceMs)) return true
+  try {
+    process.kill(-pid, 'SIGKILL')
+  } catch {
+    // 组在 SIGTERM 宽限的最后一刻空了
+  }
+  return waitForGroupGone(pid, killGraceMs)
+}
+
+function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true)
+  return new Promise((resolveExit) => {
+    const timer = setTimeout(() => {
+      child.off('exit', onExit)
+      resolveExit(false)
+    }, timeoutMs)
+    const onExit = (): void => {
+      clearTimeout(timer)
+      resolveExit(true)
+    }
+    child.once('exit', onExit)
+  })
+}
+
+/**
+ * 杀整个进程组。pid 都拿不到（spawn 直接失败）才短路；其余一律按组探活。
+ * Windows 没有负 pid 进程组，只能退化为终止直接子进程。
+ */
+export async function killProcessTree(child: ChildProcess): Promise<boolean> {
+  const pid = child.pid
+  if (pid === undefined) return true
+
+  if (process.platform === 'win32') {
+    if (child.exitCode !== null || child.signalCode !== null) return true
+    const exited = waitForExit(child, KILL_GRACE_MS)
+    try {
+      child.kill('SIGTERM')
+    } catch {
+      // 已退出
+    }
+    if (await exited) return true
+    const killed = waitForExit(child, KILL_KILL_GRACE_MS)
+    try {
+      child.kill('SIGKILL')
+    } catch {
+      // 已退出
+    }
+    return killed
+  }
+
+  return terminateGroup(pid, KILL_GRACE_MS, KILL_KILL_GRACE_MS)
+}
+
+async function writePidFile(dir: string, name: string, pid: number): Promise<void> {
+  try {
+    await writeFile(join(dir, name), String(pid), 'utf8')
+  } catch {
+    // pid 文件只用于下一次清理陈旧目录，写失败不影响主流程
+  }
+}
+
+async function readPidFile(dir: string, name: string): Promise<number | null> {
+  try {
+    const raw = await readFile(join(dir, name), 'utf8')
+    const pid = Number.parseInt(raw.trim(), 10)
+    return Number.isInteger(pid) && pid > 0 ? pid : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 上一次冒烟如果被外部重启/强杀打断，finally 不会执行，会留下 dsh-smoke-* 目录和 detached 试跑实例。
+ * 每次冒烟前先收一遍：run.pid 还活着说明是并发中的冒烟，跳过；否则杀掉 dsh.pid 的进程组再删目录。
+ */
+export async function cleanupStaleSmokeDirs(
+  tmpRoot: string,
+): Promise<{ removed: string[]; failures: Failure[] }> {
+  const removed: string[] = []
+  const failures: Failure[] = []
+  let entries
+  try {
+    entries = await readdir(tmpRoot, { withFileTypes: true })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { removed, failures }
+    throw error
+  }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith(SMOKE_DIR_PREFIX)) continue
+    const dir = join(tmpRoot, entry.name)
+    const ownerPid = await readPidFile(dir, RUN_PID_FILE)
+    if (ownerPid !== null && processAlive(ownerPid)) continue
+
+    const dshPid = await readPidFile(dir, DSH_PID_FILE)
+    if (dshPid !== null) {
+      const cleaned = await terminateGroup(dshPid, KILL_GRACE_MS, KILL_KILL_GRACE_MS)
+      if (!cleaned) {
+        failures.push({
+          kind: 'boot',
+          message:
+            '陈旧冒烟目录 ' + dir + ' 的进程组 ' + String(dshPid) + ' 杀不掉，保留目录待人工处理',
+        })
+        continue
+      }
+    }
+
+    try {
+      await rm(dir, { recursive: true, force: true })
+      removed.push(entry.name)
+    } catch (error) {
+      failures.push({
+        kind: 'boot',
+        message: '清理陈旧冒烟目录 ' + dir + ' 失败：' + messageOf(error),
+      })
+    }
+  }
+
+  return { removed, failures }
+}
+
 /**
  * 从 stderr 里抽「本次没激活」的条目 id 名单。
  *
  * 宿主有两种格式：
- * - 可选条目：'dsh web: warning: N entries did not activate' 后跟 'id (pkg): detail' 若干行；
+ * - 可选条目：'dsh web: warning: N entries did not activate' 后紧跟 'id (pkg): detail' 若干行；
  * - 必需条目：'dsh web: startup failed: ...' 下的 'Failed plugins' 块，id 单独一行、下一行是 'Package:'。
  * 没有 did not activate 标记时一律返回空，避免把别的告警误当未激活名单。
+ * 可选条目只扫描紧跟告警头的一段连续诊断行，避免同屏无关的 'x (y): z' 污染基线。
+ * 宿主的 pending 表格（Plugins waiting for services）不解析；走到那条路径时 /health 通常不会 200，
+ * 由失败分类兜底，不会把 pending 条目静默当成已激活。
  */
 export function parseNotActivated(stderr: string): string[] {
-  if (!stderr.includes(ACTIVATION_MARKER)) return []
+  const lines = stderr.split(/\r?\n/)
+  if (!lines.some((line) => line.includes(ACTIVATION_MARKER))) return []
 
   const entries: string[] = []
   const seen = new Set<string>()
@@ -139,19 +330,24 @@ export function parseNotActivated(stderr: string): string[] {
     entries.push(id)
   }
 
-  const lines = stderr.split(/\r?\n/)
   for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index] ?? ''
-    const diagnostic = DIAGNOSTIC_LINE.exec(line)
-    if (diagnostic !== null) {
-      push(diagnostic[1] ?? '')
-      continue
+    if (!OPTIONAL_HEADER.test(lines[index] ?? '')) continue
+    let cursor = index + 1
+    while (cursor < lines.length) {
+      const match = DIAGNOSTIC_LINE.exec(lines[cursor] ?? '')
+      if (match === null) break
+      push(match[1] ?? '')
+      cursor += 1
     }
-    const failed = STARTUP_FAILED_LINE.exec(line)
+  }
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const failed = STARTUP_FAILED_LINE.exec(lines[index] ?? '')
     if (failed !== null && STARTUP_PACKAGE_LINE.test(lines[index + 1] ?? '')) {
       push(failed[1] ?? '')
     }
   }
+
   return entries
 }
 
@@ -194,8 +390,9 @@ export async function runDumpConfig(profileDir: string): Promise<Failure[]> {
   const profile = resolve(profileDir)
   const profileName = basename(profile)
   const home = dirname(dirname(profile))
+  const bin = resolveDshBin()
 
-  const outcome = await runCommand('dsh', ['--profile', profileName, '--dump-config'], {
+  const outcome = await runCommand(bin, ['--profile', profileName, '--dump-config'], {
     env: { ...process.env, DSH_HOME: home },
     timeoutMs: DUMP_CONFIG_TIMEOUT_MS,
   })
@@ -204,7 +401,7 @@ export async function runDumpConfig(profileDir: string): Promise<Failure[]> {
     return [
       {
         kind: 'config',
-        message: '无法启动 dsh --dump-config：' + outcome.spawnError,
+        message: '无法启动 ' + bin + ' --dump-config：' + outcome.spawnError,
       },
     ]
   }
@@ -213,7 +410,8 @@ export async function runDumpConfig(profileDir: string): Promise<Failure[]> {
       {
         kind: 'config',
         message:
-          'dsh --profile ' +
+          bin +
+          ' --profile ' +
           profileName +
           ' --dump-config 在 ' +
           String(DUMP_CONFIG_TIMEOUT_MS) +
@@ -225,11 +423,13 @@ export async function runDumpConfig(profileDir: string): Promise<Failure[]> {
     return [
       {
         kind: 'config',
-        message: 'dsh --profile ' + profileName + ' --dump-config 失败（' + describeCommand(outcome) + '）',
+        message: bin + ' --profile ' + profileName + ' --dump-config 失败（' + describeCommand(outcome) + '）',
       },
     ]
   }
 
+  // dump-config 不激活条目，正常情况下这个分支不会触发；保留以覆盖宿主未来在
+  // 合成阶段也输出 activation 诊断的异常，避免静默放过。
   return parseNotActivated(outcome.stderr).map((entry) => ({
     kind: 'config',
     plugin: entry,
@@ -257,88 +457,53 @@ async function cloneProfile(source: string, dest: string): Promise<Failure | nul
   }
 }
 
-function portFromStdout(stdout: string): number | null {
+function parseWebUrl(stdout: string): WebUrlProbe {
   const line = WEB_URL_LINE.exec(stdout)
-  if (line === null) return null
+  if (line === null) return { port: null, urlWithoutPort: null }
+
+  const raw = line[1] ?? ''
   try {
-    const url = new URL(line[1] ?? '')
+    const url = new URL(raw)
     const port = Number(url.port)
-    return Number.isInteger(port) && port > 0 ? port : null
+    if (Number.isInteger(port) && port > 0) return { port, urlWithoutPort: null }
+    return { port: null, urlWithoutPort: raw }
   } catch {
-    return null
+    return { port: null, urlWithoutPort: raw }
   }
 }
 
-function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true)
-  return new Promise((resolveExit) => {
-    const timer = setTimeout(() => {
-      child.off('exit', onExit)
-      resolveExit(false)
-    }, timeoutMs)
-    const onExit = (): void => {
-      clearTimeout(timer)
-      resolveExit(true)
-    }
-    child.once('exit', onExit)
-  })
+/** 等到输出安静 OUTPUT_QUIET_MS，或到上限；避免固定 100ms 掩盖写者顺序。 */
+async function settleOutput(lastOutputAt: () => number): Promise<void> {
+  const cap = Date.now() + OUTPUT_SETTLE_CAP_MS
+  while (Date.now() < cap) {
+    if (Date.now() - lastOutputAt() >= OUTPUT_QUIET_MS) return
+    await delay(25)
+  }
 }
 
-/** detached 后的子进程是新进程组组长，负 pid 一次带走它和它拉起的子进程。 */
-async function killProcessTree(child: ChildProcess): Promise<boolean> {
-  const pid = child.pid
-  if (pid === undefined || child.exitCode !== null || child.signalCode !== null) return true
-
-  const signalGroup = (signal: NodeJS.Signals): boolean => {
-    if (process.platform === 'win32') return false
-    try {
-      process.kill(-pid, signal)
-      return true
-    } catch {
-      return false
-    }
-  }
-
-  const exited = waitForExit(child, KILL_GRACE_MS)
-  if (!signalGroup('SIGTERM')) {
-    try {
-      child.kill('SIGTERM')
-    } catch {
-      // 已经退出
-    }
-  }
-  if (await exited) return true
-
-  const killed = waitForExit(child, KILL_KILL_GRACE_MS)
-  if (!signalGroup('SIGKILL')) {
-    try {
-      child.kill('SIGKILL')
-    } catch {
-      // 已经退出
-    }
-  }
-  return killed
-}
-
-/** 起试跑实例、等 /health；无论结果如何都在 finally 里结束进程。 */
+/** 起试跑实例、等 /health；无论结果如何都在 finally 里结束进程组。 */
 async function runWebInClone(
   tmpHome: string,
   profileName: string,
   timeoutMs: number,
 ): Promise<{ ok: boolean; failures: Failure[]; failedEntries: string[] }> {
-  const bin = process.env.DSH_RESTART_DSH_BIN ?? 'dsh'
+  const bin = resolveDshBin()
+  const homeNote = '（试跑 DSH_HOME: ' + tmpHome + '，仅克隆 profile 层）'
   const child = spawn(bin, ['--profile', profileName, '--port', '0', '--no-open'], {
     env: { ...process.env, DSH_HOME: tmpHome, DSH_DAEMON_OPEN_BROWSER: '0' },
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: process.platform !== 'win32',
   })
+  if (child.pid !== undefined) await writePidFile(tmpHome, DSH_PID_FILE, child.pid)
 
   let stdout = ''
   let stderr = ''
+  let lastOutputAt = Date.now()
   // 数组而不是 let：TS 不追踪回调里的赋值，用 let 会在检查处被收窄成 null
   const spawnErrors: string[] = []
   const exitRecords: Array<{ code: number | null; signal: string | null }> = []
   let port: number | null = null
+  let urlWithoutPort: string | null = null
   let healthStatus: number | null = null
   let lastProbeError = ''
   let ok = false
@@ -347,16 +512,21 @@ async function runWebInClone(
   child.stderr?.setEncoding('utf8')
   child.stdout?.on('data', (chunk: string) => {
     stdout = appendCapped(stdout, chunk, STDOUT_LIMIT)
+    lastOutputAt = Date.now()
   })
   child.stderr?.on('data', (chunk: string) => {
     stderr = appendCapped(stderr, chunk, STDERR_LIMIT)
+    lastOutputAt = Date.now()
   })
   child.once('error', (error) => {
     spawnErrors.push(messageOf(error))
   })
-  // close 保证 stdout/stderr 都收完了；exit 更早但可能丢最后一段
-  child.once('close', (code, signal) => {
+  // exit 用于「提前退出」判定；close 只用于给管道冲刷留一个上限，sidecar 占着管道也不会无限等
+  child.once('exit', (code, signal) => {
     exitRecords.push({ code, signal })
+  })
+  const streamClosed = new Promise<void>((resolveClosed) => {
+    child.once('close', () => resolveClosed())
   })
 
   const failures: Failure[] = []
@@ -364,9 +534,9 @@ async function runWebInClone(
   try {
     while (Date.now() < deadline) {
       if (spawnErrors.length > 0 || exitRecords.length > 0) break
-      if (port === null) {
-        port = portFromStdout(stdout)
-      }
+      const probe = parseWebUrl(stdout)
+      if (probe.port !== null) port = probe.port
+      if (probe.urlWithoutPort !== null) urlWithoutPort = probe.urlWithoutPort
       if (port !== null) {
         try {
           const response = await fetch('http://127.0.0.1:' + String(port) + '/health', {
@@ -385,12 +555,19 @@ async function runWebInClone(
     }
 
     if (ok) {
-      // 告警写在 URL 之前，但 stdout/stderr 是两个管道；等一拍确保最后一行已到
-      await delay(100)
+      // 告警通常写在 URL 之前，但 stdout/stderr 是两个写者；等输出静默再取名单
+      await settleOutput(() => lastOutputAt)
+    } else if (exitRecords.length > 0) {
+      // 组长先退出时 close 可能被 sidecar 拖住；只等一小段，避免把「提前退出」误报成超时
+      await Promise.race([streamClosed, delay(EXIT_FLUSH_MS)])
+    }
+
+    if (ok) {
+      // ok 语义保持「/health 200」；清理失败会在 finally 追加到 failures
     } else if (spawnErrors.length > 0) {
       failures.push({
         kind: 'boot',
-        message: '无法启动试跑实例（' + bin + '）：' + (spawnErrors[0] ?? ''),
+        message: '无法启动试跑实例（' + bin + '）：' + (spawnErrors[0] ?? '') + homeNote,
       })
     } else if (exitRecords.length > 0) {
       const exitState = exitRecords[0]!
@@ -401,7 +578,18 @@ async function runWebInClone(
       const detail = tail(stderr)
       failures.push({
         kind: 'boot',
-        message: '试跑实例提前退出（' + status + '）' + (detail === '' ? '' : '：' + detail),
+        message:
+          '试跑实例提前退出（' + status + '）' +
+          (detail === '' ? '' : '：' + detail) +
+          homeNote,
+      })
+    } else if (port === null && urlWithoutPort !== null) {
+      failures.push({
+        kind: 'boot',
+        message:
+          '试跑实例打印的 Web URL 取不到本地监听端口（可能是 public-url 形态）：' +
+          urlWithoutPort +
+          homeNote,
       })
     } else if (port === null) {
       const detail = tail(stderr)
@@ -411,7 +599,8 @@ async function runWebInClone(
           '试跑实例在 ' +
           String(timeoutMs) +
           'ms 内没有打印 Web URL' +
-          (detail === '' ? '' : '：' + detail),
+          (detail === '' ? '' : '：' + detail) +
+          homeNote,
       })
     } else {
       const probe = lastProbeError === '' ? '' : '，最后探活错误：' + lastProbeError
@@ -425,7 +614,8 @@ async function runWebInClone(
           'ms 内未返回 200（最后状态：' +
           (healthStatus === null ? '无响应' : String(healthStatus)) +
           probe +
-          '）',
+          '）' +
+          homeNote,
       })
     }
 
@@ -435,7 +625,9 @@ async function runWebInClone(
     if (!cleaned) {
       failures.push({
         kind: 'boot',
-        message: '试跑实例（pid ' + String(child.pid) + '）在 SIGKILL 后仍未退出，可能留下孤儿进程',
+        message:
+          '试跑实例（pid ' + String(child.pid) + '）的进程组在 SIGKILL 后仍未退出，可能留下孤儿进程' +
+          homeNote,
       })
     }
   }
@@ -443,7 +635,10 @@ async function runWebInClone(
 
 /**
  * 配置合成已在别处做过（runDumpConfig）；这里只负责「换个 DSH_HOME 真启动一次」。
- * ok 只代表 /health 200，未激活名单通过 failedEntries 返回。
+ * ok 只代表 /health 200；调用方必须同时检查 failures 与基线差分的 added。
+ *
+ * 只克隆 profile 层：home 级的 .env / settings.yaml / plugins / daemon 不参与，
+ * 所以试跑看到的环境分层可能与线上不同（理论上会造成假红或假绿）。
  */
 export async function runSmoke(options: SmokeOptions): Promise<SmokeResult> {
   const startedAt = Date.now()
@@ -458,15 +653,24 @@ export async function runSmoke(options: SmokeOptions): Promise<SmokeResult> {
   try {
     const tmpRoot = resolve(options.tmpRoot)
     await mkdir(tmpRoot, { recursive: true })
-    tmpHome = await mkdtemp(join(tmpRoot, 'dsh-smoke-'))
-    await mkdir(join(tmpHome, 'profiles'), { recursive: true })
 
-    const clonedProfile = join(tmpHome, 'profiles', profileName)
+    const stale = await cleanupStaleSmokeDirs(tmpRoot)
+    failures.push(...stale.failures)
+
+    tmpHome = await mkdtemp(join(tmpRoot, SMOKE_DIR_PREFIX))
+    const home = tmpHome
+    await writePidFile(home, RUN_PID_FILE, process.pid)
+    await mkdir(join(home, 'profiles'), { recursive: true })
+
+    const clonedProfile = join(home, 'profiles', profileName)
     const cloneFailure = await cloneProfile(profileDir, clonedProfile)
     if (cloneFailure !== null) {
-      failures.push(cloneFailure)
+      failures.push({
+        ...cloneFailure,
+        message: cloneFailure.message + '（试跑 DSH_HOME: ' + home + '，仅克隆 profile 层）',
+      })
     } else {
-      const run = await runWebInClone(tmpHome, profileName, timeoutMs)
+      const run = await runWebInClone(home, profileName, timeoutMs)
       ok = run.ok
       failedEntries = run.failedEntries
       failures.push(...run.failures)
