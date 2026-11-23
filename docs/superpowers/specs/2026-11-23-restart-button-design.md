@@ -16,12 +16,12 @@
 
 | 文件 | 干什么 |
 |---|---|
-| `src/index.ts` | 插件入口。向 `ctx.webServer.register({kind:'prefix', path:'/dsh-restart/'})` 挂路由；组装下面几个模块 |
+| `src/index.ts` | 插件入口。向 `ctx.webServer.register({kind:'exact', path})` 挂三条 `kind:'exact'` 路由（`/dsh-restart/api/status`、`/dsh-restart/api/precheck`、`/dsh-restart/api/restart`）；组装下面几个模块 |
 | `src/server/last.ts` | 当前端口、探 `/health`、读写 `~/.dsh/dsh-restart/last.json`、算 profile 指纹 |
-| `src/server/compat.ts` | 快检 A/B：跑 `dsh --profile web --dump-config`；兼容性直接 import `@deepseek-ai/dsh-app-boot` 的 `evaluatePluginCompatibility` / `getDshRuntimeVersion`，不自己写版本比较 |
+| `src/server/compat.ts` | 快检 A/B：跑 `dsh --profile web --dump-config`；兼容性判定用宿主 `@deepseek-ai/dsh-app-boot` 的 `evaluatePluginCompatibility` / `getDshRuntimeVersion`，不自己写版本比较；但**该包必须 external（不内联），运行时从 dsh 安装根解析**，否则 `getDshRuntimeVersion()` 会读回本插件自己的 version；解析不到时快检判失败（fail-closed），不静默通过 |
 | `src/server/smoke.ts` | 冒烟：APFS 克隆当前 profile → 临时 DSH_HOME，另起 `dsh web --port 0 --no-open`，等 `/health`，收 stderr 里的 `did not activate` 名单，杀进程、删目录 |
 | `src/server/restart.ts` | 重启：先回 202，再 fork 一个脱离的 helper；helper 自己先试 `dsh-daemon restart`，端口没回来就自拉起 |
-| `src/client/inject.ts` | 往「更多」弹层倒数第二行插入 menuitem + MutationObserver 补挂；锚点找不到时退到 `sidebar.footer.action` 插槽 |
+| `src/client/inject.ts` | 往「更多」弹层倒数第二行插入 menuitem + MutationObserver 补挂；锚点找不到时退到账号菜单旁 `[data-slot="settings.launcher"]` 上方插同款行 |
 | `src/client/dialog.ts` `src/client/dialog.css.ts` | 弹窗本体与样式，照参考截图 |
 | `scripts/install.mjs` | 一次性装进 web profile：写依赖、链过去、往 profile 的 `cordis.patch.yml` 加条目、删悬空软链 |
 | `package.json` | 构建出 `lib/index.js` + `lib/client.js`（客户端必须是构建产物，宿主不编 TS），`dsh.client = { platform: 'web', immediately: true }` |
@@ -30,7 +30,7 @@
 
 1. 外壳渲染账号菜单 → MutationObserver 看到弹层出现 → 在最后一项（退出登录 / 登录）之前插一颗 menuitem。
 2. 点击 → 弹窗 `GET /dsh-restart/api/status`：端口、健康、上次结果（带指纹判定是否过期），一次填满。
-3. 点「开始模拟检查」→ `POST /dsh-restart/api/precheck` → 快检 A → 快检 B → 冒烟 C，阶段通过 SSE 推给弹窗，结果写 `last.json`。
+3. 点「开始模拟检查」→ `POST /dsh-restart/api/precheck` → 快检 A → 快检 B → 冒烟 C，阶段通过 NDJSON 流（每阶段一行，结尾 `{"done":true}`）推给弹窗，结果写 `last.json`。
 4. 点「重启 dsh web」→ `POST /dsh-restart/api/restart` 先回 202，300ms 后 fork 脱离 helper（响应必须在进程死之前落到 socket）。
 5. 弹窗轮询 `/health` 与 `/dsh-restart/api/status`，两个都 200 才显示「已回来」，90 秒超时报红。
 
