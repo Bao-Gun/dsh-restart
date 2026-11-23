@@ -1,11 +1,14 @@
 import { defineConfig } from 'tsup'
 
-// 两份产物、两种运行环境：
+// 三份产物、三种运行环境：
 // - 宿主入口 src/index.ts 跑在 Node 里，@deepseek-ai/* 是宿主提供的运行期依赖，
 //   必须 external（否则内联 app-boot 后 getDshRuntimeVersion() 会读成插件自己的版本）。
 // - 客户端入口 src/client/index.ts 跑在浏览器里，用 classic script 加载，
 //   必须产出 iife，并用 banner/footer 把整个模块体包进宿主的 factory，
 //   保证首行自注册、模块体副作用延迟到 materialize 时执行。
+// - 重启 helper src/helper/restart.ts 是被 scheduleRestart 用 node 直接拉起的
+//   独立进程（不经过宿主加载器），所以单独产出一份 esm 到 lib/helper.js；
+//   它和宿主入口一样把 @deepseek-ai/* 标成 external。
 // 注意：产物目录清理由 package.json 的 build 脚本负责（rm -rf lib）。
 // tsup 9 对数组配置是并发的（Promise.all），任何一份配置 clean: true 都会
 // 在另一份写完之后把它删掉，所以这里两份都不设 clean。
@@ -36,5 +39,16 @@ export default defineConfig([
     footer: {
       js: 'return __dsh_restart_client;\n} });',
     },
+  },
+  {
+    entry: { helper: 'src/helper/restart.ts' },
+    format: ['esm'],
+    platform: 'node',
+    target: 'node22',
+    outDir: 'lib',
+    splitting: false,
+    sourcemap: true,
+    external: [/^@deepseek-ai\//],
+    banner: { js: '#!/usr/bin/env node' },
   },
 ])

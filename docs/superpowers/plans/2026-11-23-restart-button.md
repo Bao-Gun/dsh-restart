@@ -109,11 +109,11 @@
 **Interfaces:**
 - Produces: `waitForPort(port: number, timeoutMs: number, probe?: (port: number) => Promise<boolean>): Promise<boolean>`；`pickRoute(daemonInstalled: boolean, paused: boolean): 'daemon' | 'helper'`；`isRefused(lockPath: string): Promise<boolean>`；`scheduleRestart(opts: { port: number; profileDir: string; logDir: string }): void`（`spawn(process.execPath, [helperPath], { detached: true, stdio: 'ignore' }).unref()`）；`runRestartHelper(opts: { port: number; profileDir: string; waitMs?: number }): Promise<0 | 1>`。
 
-- [ ] **Step 1: 写失败测试**：`pickRoute(false,false)==='helper'`、`pickRoute(true,true)==='helper'`、`pickRoute(true,false)==='daemon'`；已有 lock 文件时 `isRefused` 为 `true`；`waitForPort(port, 200, fakeFetch)` 在探活一直失败时返回 `false` 且耗时不超过上界。
-- [ ] **Step 2: 跑测试，确认失败。**
-- [ ] **Step 3: 实现**。helper 流程：拿 lock → `spawn('dsh-daemon',['restart'])` 并轮询端口至上界（默认 60s）→ 端口没回来则 `spawn('dsh',['web','--profile','web','--port',String(port),'--no-open'],{detached:true, env:{...process.env, DSH_DAEMON_OPEN_BROWSER:'0'}})` → 全程写 `~/.dsh/dsh-restart/helper-<ts>.log` → 释放 lock。
-- [ ] **Step 4: 跑测试，确认通过。**
-- [ ] **Step 5: Commit** `feat: 重启 helper（daemon 优先，自拉起兜底）`
+- [x] **Step 1: 写失败测试**：`pickRoute(false,false)==='helper'`、`pickRoute(true,true)==='helper'`、`pickRoute(true,false)==='daemon'`；已有 lock 文件时 `isRefused` 为 `true`；`waitForPort(port, 200, fakeFetch)` 在探活一直失败时返回 `false` 且耗时不超过上界。
+- [x] **Step 2: 跑测试，确认失败。**
+- [x] **Step 3: 实现**。helper 流程：拿 lock → `spawn('dsh-daemon',['restart'])` 并轮询端口至上界（默认 60s）→ 端口没回来则 `spawn('dsh',['web','--profile','web','--port',String(port),'--no-open'],{detached:true, env:{...process.env, DSH_DAEMON_OPEN_BROWSER:'0'}})` → 全程写 `~/.dsh/dsh-restart/helper-<ts>.log` → 释放 lock。
+- [x] **Step 4: 跑测试，确认通过。**
+- [x] **Step 5: Commit** `feat: 重启 helper（daemon 优先，自拉起兜底）`
 
 ### Task 6: 三条路由与鉴权
 

@@ -1,6 +1,6 @@
 # 重启按钮（侧栏「更多」倒数第二行）设计
 
-日期：2026-11-23 · 项目：dsh-restart · 状态：实现中（Task 3 已落兼容性快检：宿主判定 + fail-closed）
+日期：2026-11-23 · 项目：dsh-restart · 状态：实现中（Task 3 已落兼容性快检：宿主判定 + fail-closed；Task 5 已落重启 helper：daemon 优先、自拉起兜底）
 
 ## 现在是什么情况
 
