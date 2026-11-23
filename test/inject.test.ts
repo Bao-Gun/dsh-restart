@@ -8,7 +8,7 @@
  *   dsh-web-frontend/dist/assets/index-*.js 的 Zu 组件）。
  * - 账号菜单的按钮列有「设置 / 联系我们 / 退出登录」三行，我们要插在退出登录之前。
  *
- * 全程不发真实网络请求：所有 fetch / confirm 都是注入的假实现。
+ * 全程不发真实网络请求：fetch 是注入的假实现。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -158,6 +158,20 @@ describe('injectMenuRow：没有菜单时什么都不插', () => {
       expect(launcher?.previousElementSibling?.hasAttribute('data-dsh-restart-launcher-row')).not.toBe(true)
       expect(document.querySelectorAll('[data-dsh-restart-launcher-row]')).toHaveLength(0)
       expect(rows(document)).toHaveLength(0)
+    } finally {
+      dispose()
+    }
+  })
+
+  // 实机反馈：菜单弹出来之后才插行，能看见「先空着、再冒出来」的一瞬。
+  // 现在菜单一挂上来就在 MutationObserver 的微任务里补，赶在绘制之前。
+  it('菜单一出现就当场补行，不等防抖窗口', async () => {
+    // debounce 给 5 秒：只有「立刻插」这条路径能让它出现。
+    const dispose = injectMenuRow(document, { onOpen: () => undefined, debounceMs: 5000 })
+    try {
+      document.body.innerHTML = fallbackOnly() + accountMenu()
+      await wait(0)
+      expect(rows(document)).toHaveLength(1)
     } finally {
       dispose()
     }
@@ -358,6 +372,15 @@ function restartButton(): HTMLButtonElement {
   return document.querySelector('[data-dsh-restart-restart]') as HTMLButtonElement
 }
 
+function ackInput(): HTMLInputElement {
+  return document.querySelector('[data-dsh-restart-ack]') as HTMLInputElement
+}
+
+/** 勾选框外层 label：显隐在 label 上，input 本身不被隐藏。 */
+function ackWrap(): HTMLElement {
+  return document.querySelector('[data-dsh-restart-ack-wrap]') as HTMLElement
+}
+
 function dialogRoot(): Element | null {
   return document.querySelector('[data-dsh-restart-dialog]')
 }
@@ -513,6 +536,7 @@ describe('mountDialog：五段与状态', () => {
     expect(warnings[1]?.textContent).toContain('stale-plugin')
     expect(document.querySelectorAll('[data-dsh-restart-failure]')).toHaveLength(0)
     expect(restartButton().disabled).toBe(false)
+    expect(ackWrap().hidden).toBe(true)
     expect(noticeText()).toContain('2 条提示')
   })
 
@@ -528,7 +552,7 @@ describe('mountDialog：五段与状态', () => {
     expect(document.body.textContent).not.toContain('本次检查为准')
   })
 
-  it('「我知道风险，直接重启」走 confirm() 二次确认', async () => {
+  it('预检判红时给勾选框：勾上才点亮重启，不再弹 confirm', async () => {
     const lines = [
       JSON.stringify({ stage: 'config', ok: false, failures: [{ kind: 'config', message: 'dump-config 挂了' }] }),
       JSON.stringify({ stage: 'compat', ok: true, failures: [] }),
@@ -541,25 +565,50 @@ describe('mountDialog：五段与状态', () => {
       '/dsh-restart/api/precheck': ndjsonResponse(lines),
       '/dsh-restart/api/restart': jsonResponse({ ok: true, at: '2026-11-23T04:00:01.000Z', port: 3080 }, 202),
     })
-    const confirmImpl = vi.fn(() => false)
-    const dialog = mountDialog(document, { fetchImpl, confirmImpl })
+    const dialog = mountDialog(document, { fetchImpl })
     dialog.open()
     await settle()
     precheckButton().click()
     await waitFor(() => precheckButton().disabled === false)
     expect(document.querySelectorAll('[data-dsh-restart-failure]')).toHaveLength(1)
 
-    ;(document.querySelector('[data-dsh-restart-force]') as HTMLButtonElement).click()
-    await settle()
-    expect(confirmImpl).toHaveBeenCalledTimes(1)
+    // 判红：勾选框露出来，按钮还是暗的。
+    expect(ackWrap().hidden).toBe(false)
+    expect(restartButton().disabled).toBe(true)
     expect(calls.some((call) => call.url === '/dsh-restart/api/restart')).toBe(false)
 
-    confirmImpl.mockReturnValue(true)
-    ;(document.querySelector('[data-dsh-restart-force]') as HTMLButtonElement).click()
+    // 勾上就点亮，点了直接重启：中间不再有 confirm()。
+    ackInput().click()
+    expect(ackInput().checked).toBe(true)
+    expect(restartButton().disabled).toBe(false)
+    restartButton().click()
     await settle()
     const restartCall = calls.find((call) => call.url === '/dsh-restart/api/restart')
     expect(restartCall?.init.method).toBe('POST')
     expect(restartCall?.init.headers?.['x-dsh-restart']).toBe('1')
+  })
+
+  it('勾上再取消勾选，重启按钮重新变暗', async () => {
+    const lines = [
+      JSON.stringify({ stage: 'config', ok: false, failures: [{ kind: 'config', message: 'dump-config 挂了' }] }),
+      JSON.stringify({ stage: 'compat', ok: true, failures: [] }),
+      JSON.stringify({ stage: 'boot', ok: true, failures: [], entries: [], added: [], health: true }),
+      JSON.stringify({ done: true }),
+    ].join('\n') + '\n'
+    const { fetchImpl } = fakeFetch({
+      '/dsh-restart/api/status': jsonResponse(statusPayload()),
+      '/dsh-restart/api/precheck': ndjsonResponse(lines),
+    })
+    const dialog = mountDialog(document, { fetchImpl })
+    dialog.open()
+    await settle()
+    precheckButton().click()
+    await waitFor(() => precheckButton().disabled === false)
+
+    ackInput().click()
+    expect(restartButton().disabled).toBe(false)
+    ackInput().click()
+    expect(restartButton().disabled).toBe(true)
   })
 
   /* ---- 评审 C1/M1/M2 的回归用例 ---- */
@@ -589,7 +638,7 @@ describe('mountDialog：五段与状态', () => {
     // 本轮判红之后，上一次的「通过」不能再放行。
     expect(textOf('[data-dsh-restart-stage="compat"]')).toContain('未通过')
     expect(restartButton().disabled).toBe(true)
-    expect((document.querySelector('[data-dsh-restart-force]') as HTMLButtonElement).hidden).toBe(false)
+    expect(ackWrap().hidden).toBe(false)
   })
 
   it('检查中关掉弹窗：在飞请求被 abort、流被 cancel（M1）', async () => {

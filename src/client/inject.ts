@@ -14,7 +14,12 @@
  * 行样式不自定义：class 直接抄相邻 menuitem，配色/尺寸/间距跟着宿主设计系统走。
  */
 
-/** MutationObserver 的防抖窗口；React 一次重渲染会连发很多条 mutation。 */
+/**
+ * MutationObserver 的防抖窗口；React 一次重渲染会连发很多条 mutation。
+ *
+ * 只在「菜单已经在、我们的行也已经在」之后才用得上：菜单刚出现的那一次是当场插入的，
+ * 不走这个窗口（否则用户会看到菜单先弹出来、行再冒出来）。
+ */
 export const DEFAULT_DEBOUNCE_MS = 100
 /** 菜单行文案。 */
 export const MENU_ROW_LABEL = '重启'
@@ -56,9 +61,18 @@ export function injectMenuRow(doc: Document, opts: InjectMenuRowOptions): () => 
     timer = null
   }
 
-  const ensureRow = (): void => {
-    if (disposed || doc.body === null) return
-    injectIntoMenu(doc, opts.onOpen)
+  const ensureRow = (): boolean => {
+    if (disposed || doc.body === null) return false
+    return injectIntoMenu(doc, opts.onOpen)
+  }
+
+  /** 菜单状态：没开 / 开着但没我们的行 / 已经插好了。 */
+  const menuState = (): 'none' | 'bare' | 'ready' => {
+    if (doc.body === null) return 'none'
+    const menus = Array.from(doc.querySelectorAll('[role="menu"]')).filter(looksLikeAccountMenu)
+    if (menus.length === 0) return 'none'
+    const inserted = menus.every((menu) => menu.querySelector('[' + ROW_ATTR + ']') !== null)
+    return inserted ? 'ready' : 'bare'
   }
 
   const schedule = (): void => {
@@ -67,6 +81,29 @@ export function injectMenuRow(doc: Document, opts: InjectMenuRowOptions): () => 
       timer = null
       ensureRow()
     }, debounceMs)
+  }
+
+  /**
+   * 菜单一出现就当场补，不等防抖窗口。
+   *
+   * MutationObserver 的回调跑在微任务里，抢在浏览器把这一帧画出来之前插入，用户就看不到
+   * 「菜单先弹出来、我们的行再冒出来」这个过程。已经在位之后剩下的 mutation 多半是 React
+   * 重渲染的噪声，才退回防抖，避免自激。
+   */
+  const onMutations = (records: MutationRecord[]): void => {
+    if (disposed) return
+    const state = menuState()
+    if (state === 'ready') {
+      schedule()
+      return
+    }
+    // 菜单开着却没有我们的行：可能刚挂上来，也可能被重渲染冲掉了，都当场补回去。
+    if (state === 'bare' || records.some(addedLooksLikeMenu)) {
+      clearTimer()
+      if (!ensureRow()) schedule()
+      return
+    }
+    schedule()
   }
 
   const start = (): void => {
@@ -84,7 +121,7 @@ export function injectMenuRow(doc: Document, opts: InjectMenuRowOptions): () => 
     ensureRow()
     const Observer = doc.defaultView?.MutationObserver ?? globalThis.MutationObserver
     if (typeof Observer === 'function') {
-      observer = new Observer(schedule)
+      observer = new Observer(onMutations)
       observer.observe(doc.body, { childList: true, subtree: true })
     }
   }
@@ -172,6 +209,18 @@ function buildMenuRow(doc: Document, source: HTMLButtonElement, onOpen: () => vo
   button.addEventListener('click', () => onOpen())
   wrapper.appendChild(button)
   return wrapper
+}
+
+/** 这一批 mutation 里是不是新挂上来一棵「看起来像菜单」的子树。 */
+function addedLooksLikeMenu(record: MutationRecord): boolean {
+  for (const node of Array.from(record.addedNodes)) {
+    if (node.nodeType !== 1) continue
+    const element = node as Element
+    if (typeof element.matches !== 'function') continue
+    if (element.matches('[role="menu"]')) return true
+    if (element.querySelector('[role="menu"]') !== null) return true
+  }
+  return false
 }
 
 function removeMenuRows(doc: Document): void {

@@ -20,3 +20,5 @@
 - 菜单行注入带一条「没菜单就退到侧栏底部 `[data-slot="settings.launcher"]` 上方」的退路 → 实机上它插进 `div[data-slot="sidebar.settings"] > div.VOzbGW_triggerRow`，与「更多」并排成第二行，把「更多」挤没了 → 只在账号菜单里插；菜单没打开就什么都不插，MutationObserver 等它出现再补（src/client/inject.ts）。
 - 预检把插件级问题（版本不符、清单读不动、试跑里没激活）当失败 → 实机 `dsh-mcp-connector` 的 patch 条目指向一个没装好的包，预检永远红，人根本点不了重启，而 web 其实起得好好的 → 只有「配置合不出来」和「试启动起不来」拦重启，插件问题一律 `warnings` 提示（src/index.ts 的 `ok = configFailures.length === 0 && bootOk`）。
 - helper 是 detached 单进程，杀旧 web 后它自己崩了没人拉起；刚启动不到 15 秒时 daemon 还会 `restart skipped` 直接退 0 → 界面全无时只能终端救：`dsh-daemon status` → `dsh-daemon start` → 还不行 `dsh web` 前台看报错；实在不行把 profile 的 `cordis.patch.yml` 里 `restart-button` 那条 insert 块删掉再起（README「万一没回来」一节）。
+- 菜单行用统一 100ms 防抖补挂 → 菜单是点了「更多」才 portal 出来的，行要等一个防抖窗口才出现，肉眼能看见「菜单先弹、行后冒」的过程 → 菜单刚出现那一次必须在 MutationObserver 回调（微任务）里当场插，只有「已经在位」之后的重渲染噪声才防抖（src/client/inject.ts 的 `onMutations`）。
+- 预检判红用 `window.confirm` 做二次确认 → 宿主里是个阻塞弹框，与弹窗自己的视觉完全不搭，每次都要多点一次 → 改成弹窗内的「我知道风险」勾选框：勾上直接点亮重启按钮，勾选框只在「本轮跑完且判红」时显示（`src/client/dialog.ts` 的 `refreshGate`）。

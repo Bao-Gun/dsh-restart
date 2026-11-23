@@ -177,19 +177,24 @@ export const dialogCss = `
   opacity: 0.45;
   cursor: not-allowed;
 }
-.dsh-restart-force {
-  padding: 0;
+.dsh-restart-ack {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
   font-size: 11.5px;
-  font-family: inherit;
   color: var(--dsw-alias-label-tertiary, #999);
-  background: transparent;
-  border: 0;
-  text-decoration: underline;
-  text-underline-offset: 2px;
   cursor: pointer;
+  user-select: none;
 }
-.dsh-restart-force:hover {
-  color: var(--dsw-alias-state-error-primary, #c02626);
+/* display:flex 会盖掉 hidden 的默认 display:none，得自己补一条。 */
+.dsh-restart-ack[hidden] {
+  display: none;
+}
+.dsh-restart-ack input {
+  margin: 0;
+  accent-color: var(--dsw-alias-state-error-primary, #c02626);
+  cursor: pointer;
 }
 .dsh-restart-notice {
   min-height: 18px;

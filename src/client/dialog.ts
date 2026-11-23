@@ -9,7 +9,8 @@
  * - 没跑本轮预检时，status 里「上次通过且指纹没过期」的结论可以点亮按钮；
  * - 一旦点了「开始检查」，上一次的结论立刻作废：本轮全过才允许重启，本轮判红就一直禁用
  *   （「上次通过 + 本次失败」正是设计稿点名的最危险路径）；
- * - 不满足时按钮 disabled，旁边给一条小字退路，走 confirm() 二次确认；
+ * - 本轮判红时按钮 disabled，下面给一个勾选框「我知道风险」；勾上就把按钮点亮、直接重启
+ *   （用户 2026-11-23 要求：不弹 alert 二次确认）；
  * - 重启后轮询 status，要先见过「重启中/连不上」，再用 `health === true` 且非 restarting 判回来。
  */
 import type { Failure, LastRecord } from '../shared/types'
@@ -57,7 +58,6 @@ export type DialogFetch = (url: string, init: DialogRequestInit) => Promise<Dial
 
 export interface MountDialogOptions {
   fetchImpl?: DialogFetch
-  confirmImpl?: (message: string) => boolean
   /** 重启后轮询间隔，默认 2s。 */
   pollIntervalMs?: number
   /** 等 service 回来的超时，默认 90s。 */
@@ -90,7 +90,9 @@ interface DialogView {
   failures: HTMLElement
   precheck: HTMLButtonElement
   restart: HTMLButtonElement
-  force: HTMLButtonElement
+  /** 「我知道风险」勾选框的外层 label；本轮判红时才显示。 */
+  ack: HTMLElement
+  ackInput: HTMLInputElement
   closeButton: HTMLButtonElement
   onKeydown: (event: KeyboardEvent) => void
 }
@@ -100,7 +102,6 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
   const fetchImpl = options.fetchImpl ?? defaultFetch(doc)
-  const confirmImpl = options.confirmImpl ?? defaultConfirm(doc)
 
   let view: DialogView | null = null
   let disposed = false
@@ -116,6 +117,8 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
    * 会让按钮重新点亮，正好是设计稿点名的最危险路径。
    */
   let roundRan = false
+  /** 本轮预检正在跑：检查期间不给勾选框，免得一边检查一边重启。 */
+  let checking = false
   /** 在飞请求的中止器：close()/重新开跑时全部 abort。 */
   const inflight = new Set<AbortController>()
   /** 每次 open/close/重新开跑都 +1；旧回包对不上就整段丢弃。 */
@@ -141,9 +144,12 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
     if (view === null) return
     // 跑过本轮就只认本轮结果；没跑过才轮到 status 里的旧结论。
     const passed = roundRan ? localPassed : payloadPassed
-    view.restart.disabled = !passed
-    // 没通过时才给退路；通过时那条小字没有意义。
-    view.force.hidden = passed
+    // 本轮跑完且判红才给勾选框：勾上 = 认下风险，重启按钮跟着点亮。
+    // 通过时、还没跑本轮时、检查进行中都没有意义，收起来并清掉勾选，免得下次误放行。
+    const ackVisible = roundRan && !localPassed && !checking
+    if (!ackVisible) view.ackInput.checked = false
+    view.ack.hidden = !ackVisible
+    view.restart.disabled = !passed && !view.ackInput.checked
   }
 
   /** 每条请求一个中止器，登记在 inflight 里，close() 时统一 abort。 */
@@ -245,9 +251,12 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
     }
     target.precheck.disabled = false
     target.precheck.textContent = '开始检查'
+    target.ackInput.disabled = false
+    target.ackInput.checked = false
     localPassed = false
     payloadPassed = false
     roundRan = false
+    checking = false
     refreshGate()
   }
 
@@ -258,6 +267,7 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
     const { signal, done } = beginRequest()
     // 本轮开始：上一次的结论立刻作废，检查期间按钮必须是暗的。
     roundRan = true
+    checking = true
     localPassed = false
     payloadPassed = false
     target.precheck.disabled = true
@@ -312,6 +322,7 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
     } finally {
       done()
       if (live(target, ticket)) {
+        checking = false
         target.precheck.disabled = false
         target.precheck.textContent = '重新检查'
         refreshGate()
@@ -325,7 +336,7 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
     const ticket = ++token
     const { signal, done } = beginRequest()
     target.restart.disabled = true
-    target.force.hidden = true
+    target.ackInput.disabled = true
     target.precheck.disabled = true
     setNotice('正在请求重启…', 'none', target)
 
@@ -336,6 +347,7 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
         const payload = await safeJson(response)
         setNotice(typeof payload.error === 'string' ? payload.error : '已经有一个重启在进行中，等它回来。', 'warn', target)
         target.precheck.disabled = false
+        target.ackInput.disabled = false
         refreshGate()
         return
       }
@@ -346,6 +358,7 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
       if (!live(target, ticket) || isAbort(error)) return
       setNotice('重启请求失败：' + messageOf(error), 'error', target)
       target.precheck.disabled = false
+      target.ackInput.disabled = false
       refreshGate()
     } finally {
       done()
@@ -436,11 +449,8 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
         onRestart: () => {
           void startRestart()
         },
-        onForce: () => {
-          // 二次确认：默认「不重启」，避免回车误触。
-          const confirmed = confirmImpl('预检没全过，直接重启可能让 dsh web 起不来。确定继续吗？')
-          if (!confirmed) return
-          void startRestart()
+        onAckChange: () => {
+          refreshGate()
         },
       })
       ;(doc.body ?? doc.documentElement).appendChild(view.root)
@@ -466,7 +476,8 @@ interface DialogHandlers {
   onClose: () => void
   onPrecheck: () => void
   onRestart: () => void
-  onForce: () => void
+  /** 勾选框状态变了：重新算一次门禁。 */
+  onAckChange: () => void
 }
 
 /** 建 DOM。文本一律走 textContent，服务端给的失败原因不会被当成 HTML。 */
@@ -570,13 +581,20 @@ function buildDialog(doc: Document, handlers: DialogHandlers): DialogView {
   actions.appendChild(restart)
   actionSection.body.appendChild(actions)
 
-  const force = doc.createElement('button')
-  force.type = 'button'
-  force.className = 'dsh-restart-force'
-  force.setAttribute('data-dsh-restart-force', '1')
-  force.textContent = '我知道风险，直接重启'
-  force.addEventListener('click', () => handlers.onForce())
-  actionSection.body.appendChild(force)
+  // 预检判红时给这条：勾上就等于认下风险，重启按钮直接点亮，不再弹二次确认。
+  const ack = doc.createElement('label')
+  ack.className = 'dsh-restart-ack'
+  ack.setAttribute('data-dsh-restart-ack-wrap', '1')
+  ack.hidden = true
+  const ackInput = doc.createElement('input')
+  ackInput.type = 'checkbox'
+  ackInput.setAttribute('data-dsh-restart-ack', '1')
+  ackInput.addEventListener('change', () => handlers.onAckChange())
+  const ackText = doc.createElement('span')
+  ackText.textContent = '我知道风险，勾上后直接重启'
+  ack.appendChild(ackInput)
+  ack.appendChild(ackText)
+  actionSection.body.appendChild(ack)
   panel.appendChild(actionSection.root)
 
   // ⑤ 上次结果
@@ -601,7 +619,7 @@ function buildDialog(doc: Document, handlers: DialogHandlers): DialogView {
   })
   doc.addEventListener('keydown', onKeydown)
 
-  return { root, port, health, last, notice, stages, failures, precheck, restart, force, closeButton, onKeydown }
+  return { root, port, health, last, notice, stages, failures, precheck, restart, ack, ackInput, closeButton, onKeydown }
 }
 
 function section(doc: Document, label: string): { root: HTMLElement, body: HTMLElement } {
@@ -754,14 +772,6 @@ function defaultFetch(doc: Document): DialogFetch {
   const candidate = doc.defaultView?.fetch ?? globalThis.fetch
   if (typeof candidate !== 'function') return async () => { throw new Error('当前环境没有 fetch') }
   return async (url, init) => candidate.call(doc.defaultView ?? globalThis, url, init) as Promise<DialogResponse>
-}
-
-function defaultConfirm(doc: Document): (message: string) => boolean {
-  return (message) => {
-    const candidate = doc.defaultView?.confirm ?? globalThis.confirm
-    if (typeof candidate !== 'function') return false
-    return candidate.call(doc.defaultView ?? globalThis, message) === true
-  }
 }
 
 function messageOf(error: unknown): string {
