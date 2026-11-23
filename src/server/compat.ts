@@ -25,6 +25,21 @@ interface HostCompatibility {
   getDshRuntimeVersion(): string
 }
 
+/**
+ * 清单里一个形状不合规的字段。
+ *
+ * 这类清单宿主会**抛错并停用插件**（`dsh-app-boot` 的 `objectOf` / `engines.dsh` /
+ * `peerDependencies[name]` 三处都会 throw），所以不能当「没有要求」放过去。
+ */
+export interface ManifestProblem {
+  /** 字段路径，例如 `engines`、`engines.dsh`、`peerDependencies["@deepseek-ai/dsh"]` */
+  field: string
+  /** 期望的形状 */
+  expected: string
+  /** 实际拿到的值（JSON 片段，已截断） */
+  actual: string
+}
+
 /** 一个装进 profile 的插件。 */
 export interface InstalledPlugin {
   /** profile 里的身份：依赖直接就是包名，只挂在 patch 里的用条目 id */
@@ -33,13 +48,18 @@ export interface InstalledPlugin {
   version: string
   /** 插件自己声明的最低 dsh 版本；存在时宿主只认它 */
   enginesDsh?: string
-  /** 没有 engines.dsh 时才看的 `@deepseek-ai/dsh` peer 范围 */
+  /**
+   * `@deepseek-ai/dsh` 那一条 peer 范围。
+   * **仅展示用**：判定只认 `peerDependencies`（完整集合），只有手写对象缺它时才退到这里。
+   */
   peerDsh?: string
   /**
    * 完整的 dsh peer 集合。宿主的规则会逐个检查 `@deepseek-ai/dsh` 与
    * `@deepseek-ai/dsh-*`，只留 peerDsh 会让 dsh-tools 这类 peer 悄悄漏判。
    */
   peerDependencies?: Record<string, string>
+  /** 清单里形状不合规的字段；有值时直接判失败，不再交给宿主 */
+  manifestProblems?: ManifestProblem[]
 }
 
 export interface ReadInstalledOptions {
@@ -50,6 +70,7 @@ export interface ReadInstalledOptions {
 const DSH_PACKAGE = '@deepseek-ai/dsh'
 const BOOT_PACKAGE = '@deepseek-ai/dsh-app-boot'
 const BOOT_ENTRY = join('node_modules', '@deepseek-ai', 'dsh-app-boot')
+const OFFICIAL_SCOPE = '@deepseek-ai/'
 
 /** 兜底：node 与全局 node_modules 通常同层（homebrew、usr/local 都是这个形状）。 */
 const EXTRA_INSTALL_DIRS = [
@@ -57,16 +78,46 @@ const EXTRA_INSTALL_DIRS = [
   '/usr/local/lib/node_modules/@deepseek-ai/dsh',
 ]
 
+const HOST_HINT =
+  '可设 DSH_RESTART_DSH_DIR 指向 dsh 安装根，或 DSH_RESTART_BOOT_DIR 指向 @deepseek-ai/dsh-app-boot 目录后重试'
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function readJson(file: string): unknown {
+/** 读 JSON 并区分「不存在」「读不了」「解析失败」——三者对调用方的含义不一样。 */
+type JsonFile =
+  | { ok: true; value: unknown }
+  | { ok: false; missing: boolean; message: string }
+
+function readJsonFile(file: string): JsonFile {
+  let text: string
   try {
-    return JSON.parse(readFileSync(file, 'utf8'))
-  } catch {
-    return undefined
+    text = readFileSync(file, 'utf8')
+  } catch (error) {
+    const code = isPlainObject(error) && typeof error.code === 'string' ? error.code : ''
+    return {
+      ok: false,
+      missing: code === 'ENOENT',
+      message: error instanceof Error ? error.message : String(error),
+    }
   }
+  try {
+    return { ok: true, value: JSON.parse(text) }
+  } catch (error) {
+    return { ok: false, missing: false, message: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/** 报错/展示用：把任意值截成一小段 JSON。 */
+function describeValue(value: unknown): string {
+  let text: string
+  try {
+    text = JSON.stringify(value) ?? String(value)
+  } catch {
+    text = String(value)
+  }
+  return text.length > 80 ? `${text.slice(0, 77)}...` : text
 }
 
 function realpathOf(file: string): string {
@@ -91,12 +142,43 @@ function ancestorsOf(file: string): string[] {
 }
 
 function isDshInstall(dir: string): boolean {
-  const manifest = readJson(join(dir, 'package.json'))
-  return isPlainObject(manifest) && manifest.name === DSH_PACKAGE
+  const manifest = readJsonFile(join(dir, 'package.json'))
+  return manifest.ok && isPlainObject(manifest.value) && manifest.value.name === DSH_PACKAGE
 }
 
-let hostModule: HostCompatibility | null | undefined
+function discoveredCandidates(): string[] {
+  const installDirs = [
+    ...ancestorsOf(process.argv[1] ?? ''),
+    join(dirname(process.execPath), '..', 'lib', 'node_modules', DSH_PACKAGE),
+    ...EXTRA_INSTALL_DIRS,
+  ]
+  const dirs: string[] = []
+  for (const dir of installDirs) {
+    if (dir === '' || !isDshInstall(dir)) continue
+    const boot = join(dir, BOOT_ENTRY)
+    if (!dirs.includes(boot)) dirs.push(boot)
+  }
+  return dirs
+}
+
+/** 显式指定了根就以它为准：给错了要响亮失败，而不是悄悄换一个装好的 dsh。 */
+function overrideCandidates(): string[] | null {
+  const boot = process.env.DSH_RESTART_BOOT_DIR
+  const install = process.env.DSH_RESTART_DSH_DIR
+  const hasBoot = boot !== undefined && boot !== ''
+  const hasInstall = install !== undefined && install !== ''
+  if (!hasBoot && !hasInstall) return null
+
+  const dirs: string[] = []
+  if (hasBoot) dirs.push(boot as string)
+  if (hasInstall) dirs.push(join(install as string, BOOT_ENTRY))
+  return dirs
+}
+
+/** 只缓存成功结果；失败每次重试，避免一次环境抖动把整个进程钉在 fail-closed 上。 */
+let hostModule: HostCompatibility | null = null
 let hostProblem = ''
+let hostTried: string[] = []
 
 /**
  * 取宿主那份判定函数。
@@ -108,30 +190,22 @@ let hostProblem = ''
  * 返回 null 表示定位/加载失败，调用方必须报失败而不是默认放行。
  */
 export function hostCompatibility(): HostCompatibility | null {
-  if (hostModule !== undefined) return hostModule
-  hostModule = null
+  if (hostModule !== null) return hostModule
 
-  const candidates: string[] = []
-  const override = process.env.DSH_RESTART_BOOT_DIR
-  if (override !== undefined && override !== '') candidates.push(override)
-
-  const installDirs = [
-    process.env.DSH_RESTART_DSH_DIR,
-    ...ancestorsOf(process.argv[1] ?? ''),
-    join(dirname(process.execPath), '..', 'lib', 'node_modules', DSH_PACKAGE),
-    ...EXTRA_INSTALL_DIRS,
-  ]
-  for (const dir of installDirs) {
-    if (typeof dir === 'string' && dir !== '' && isDshInstall(dir)) candidates.push(join(dir, BOOT_ENTRY))
-  }
+  const candidates = overrideCandidates() ?? discoveredCandidates()
+  hostTried = candidates
+  hostProblem = '没有找到 dsh 安装目录'
 
   for (const dir of candidates) {
-    const manifest = readJson(join(dir, 'package.json'))
-    if (!isPlainObject(manifest)) {
+    const manifest = readJsonFile(join(dir, 'package.json'))
+    if (!manifest.ok || !isPlainObject(manifest.value)) {
       hostProblem = `${dir} 里没有可读的 package.json`
       continue
     }
-    const main = typeof manifest.main === 'string' && manifest.main !== '' ? manifest.main : 'lib/index.js'
+    const main =
+      typeof manifest.value.main === 'string' && manifest.value.main !== ''
+        ? manifest.value.main
+        : 'lib/index.js'
     try {
       // dsh 自己要求 node >=24.9，require(ESM) 一定可用
       const loaded = createRequire(join(dir, 'package.json'))(join(dir, main)) as Partial<HostCompatibility>
@@ -145,7 +219,7 @@ export function hostCompatibility(): HostCompatibility | null {
       hostProblem = error instanceof Error ? error.message : String(error)
     }
   }
-  return hostModule
+  return null
 }
 
 /** 生产路径的运行时版本：从宿主 API 取；取不到返回空串，交给 compatFailures 报失败。 */
@@ -157,8 +231,25 @@ export function hostRuntimeVersion(): string {
   }
 }
 
+/**
+ * 把宿主给的未满足项拼成人能读的期望值。
+ * peer 要带上包名（多 peer 时才知道是哪一条），engines.dsh 只留范围。
+ */
 function expectedOf(requirements: Record<string, string>): string {
-  return Object.values(requirements).join(', ')
+  return Object.entries(requirements)
+    .map(([field, range]) => (field === 'engines.dsh' ? range : `${field} ${range}`))
+    .join(', ')
+}
+
+function manifestProblemFailures(plugin: InstalledPlugin): Failure[] {
+  const name = plugin.name !== '' ? plugin.name : plugin.id
+  return (plugin.manifestProblems ?? []).map((problem) => ({
+    plugin: name,
+    kind: 'compat',
+    message: `插件 ${name} 的清单字段 ${problem.field} 形状不对（期望 ${problem.expected}，实际 ${problem.actual}）：宿主加载时会抛错并停用它，不能判为兼容`,
+    expected: `${problem.field} 为 ${problem.expected}`,
+    actual: problem.actual,
+  }))
 }
 
 function judgeOne(host: HostCompatibility, plugin: InstalledPlugin, runtimeVersion: string): Failure | null {
@@ -197,7 +288,7 @@ function judgeOne(host: HostCompatibility, plugin: InstalledPlugin, runtimeVersi
 /**
  * 按宿主规则判每个插件的 dsh 要求，返回不满足的那些。
  *
- * 安全点：取不到运行时版本、或加载不到宿主判定函数时，必须返回一条明确 failure。
+ * 安全点：取不到运行时版本、加载不到宿主判定函数、清单字段形状不对，都必须返回明确 failure。
  * 静默判「兼容」= 预检永远通过，比不做预检更糟。
  */
 export function compatFailures(plugins: InstalledPlugin[], runtimeVersion: string): Failure[] {
@@ -217,10 +308,11 @@ export function compatFailures(plugins: InstalledPlugin[], runtimeVersion: strin
 
   const host = hostCompatibility()
   if (host === null) {
+    const tried = hostTried.length === 0 ? '（无候选目录）' : hostTried.join('、')
     return [
       {
         kind: 'compat',
-        message: `加载不到宿主的兼容性判定（${hostProblem || BOOT_PACKAGE}），无法判定插件兼容性；不能默认放行`,
+        message: `加载不到宿主的兼容性判定（${hostProblem}；尝试过：${tried}）。${HOST_HINT}`,
         actual: runtimeVersion,
       },
     ]
@@ -228,6 +320,10 @@ export function compatFailures(plugins: InstalledPlugin[], runtimeVersion: strin
 
   const failures: Failure[] = []
   for (const plugin of plugins) {
+    if (plugin.manifestProblems !== undefined && plugin.manifestProblems.length > 0) {
+      failures.push(...manifestProblemFailures(plugin))
+      continue
+    }
     const failure = judgeOne(host, plugin, runtimeVersion)
     if (failure !== null) failures.push(failure)
   }
@@ -237,21 +333,30 @@ export function compatFailures(plugins: InstalledPlugin[], runtimeVersion: strin
 const DSH_PEER_PREFIX = `${DSH_PACKAGE}-`
 const PATCH_ID = /^\s*-\s+id:\s*(\S+)\s*$/
 const PATCH_NAME = /^\s+(?:-\s+)?name:\s*(.+?)\s*$/
-/** 只认包名形状：同一份 patch 里 model / preset 行也写 name:，带空格的会被挡掉，剩下再用「装没装」筛 */
-const PACKAGE_NAME = /^(@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*$/i
+/**
+ * 只认包名形状：npm 包名一律小写，所以不加 i 标志 —— 同一份 patch 里的模型展示名
+ * （`GLM-5`、`DeepSeek V4 Pro · Bailian Token Plan`）就这样被挡掉，剩下的再按「装没装」筛。
+ */
+const PACKAGE_NAME = /^(@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*$/
+
+/** 去掉行尾 `# 注释`：真实 patch 文件里 `- id: llm-pi-ai # magpie` 这种写法很常见。 */
+function stripComment(line: string): string {
+  const index = line.search(/\s#/)
+  return index === -1 ? line : line.slice(0, index)
+}
 
 function unquote(value: string): string {
   const trimmed = value.trim()
   const head = trimmed[0]
   if ((head === '"' || head === "'") && trimmed.endsWith(head)) return trimmed.slice(1, -1)
-  return trimmed.split(' #')[0]?.trim() ?? ''
+  return trimmed
 }
 
 /**
  * 逐行扫 cordis.patch.yml，只为拿「条目 id → 包名」。
  *
  * 不引 YAML 库（运行期零第三方依赖），也不解析再序列化：这份文件带大量注释，
- * 洗一遍就没了。拿不准的行宁可漏，后面还有「包装没装」这道筛。
+ * 洗一遍就没了。拿不准的行宁可漏，后面还有「装没装」这道筛。
  */
 async function patchEntries(profileDir: string): Promise<Array<{ id: string; name: string }>> {
   let raw: string
@@ -264,12 +369,13 @@ async function patchEntries(profileDir: string): Promise<Array<{ id: string; nam
   const entries: Array<{ id: string; name: string }> = []
   let id: string | null = null
   for (const line of raw.split(/\r?\n/)) {
-    const idMatch = PATCH_ID.exec(line)
+    const bare = stripComment(line)
+    const idMatch = PATCH_ID.exec(bare)
     if (idMatch !== null) {
       id = idMatch[1] ?? null
       continue
     }
-    const nameMatch = PATCH_NAME.exec(line)
+    const nameMatch = PATCH_NAME.exec(bare)
     if (nameMatch === null || id === null) continue
     const name = unquote(nameMatch[1] ?? '')
     if (PACKAGE_NAME.test(name)) entries.push({ id, name })
@@ -290,6 +396,62 @@ function manifestPathFor(profileDir: string, name: string): string | null {
   return existsSync(direct) ? direct : null
 }
 
+/** 按宿主会抛错的那些形状，把清单里的 dsh 要求读出来；读不准的字段记成 problem。 */
+function requirementsOf(manifest: Record<string, unknown>): {
+  enginesDsh?: string
+  peerDependencies?: Record<string, string>
+  problems: ManifestProblem[]
+} {
+  const problems: ManifestProblem[] = []
+
+  let enginesDsh: string | undefined
+  if (manifest.engines !== undefined) {
+    if (!isPlainObject(manifest.engines)) {
+      problems.push({ field: 'engines', expected: '对象', actual: describeValue(manifest.engines) })
+    } else if (manifest.engines.dsh !== undefined) {
+      const range = manifest.engines.dsh
+      if (typeof range === 'string') enginesDsh = range
+      else {
+        problems.push({
+          field: 'engines.dsh',
+          expected: '版本范围字符串',
+          actual: describeValue(range),
+        })
+      }
+    }
+  }
+
+  const peerDependencies: Record<string, string> = {}
+  if (manifest.peerDependencies !== undefined) {
+    if (!isPlainObject(manifest.peerDependencies)) {
+      problems.push({
+        field: 'peerDependencies',
+        expected: '对象',
+        actual: describeValue(manifest.peerDependencies),
+      })
+    } else {
+      // 宿主对**任意** peer 的非字符串值都会抛，所以不只查 dsh-* 那几条
+      for (const [peer, range] of Object.entries(manifest.peerDependencies)) {
+        if (typeof range !== 'string') {
+          problems.push({
+            field: `peerDependencies[${JSON.stringify(peer)}]`,
+            expected: '版本范围字符串',
+            actual: describeValue(range),
+          })
+          continue
+        }
+        if (peer === DSH_PACKAGE || peer.startsWith(DSH_PEER_PREFIX)) peerDependencies[peer] = range
+      }
+    }
+  }
+
+  return {
+    ...(enginesDsh === undefined ? {} : { enginesDsh }),
+    ...(Object.keys(peerDependencies).length === 0 ? {} : { peerDependencies }),
+    problems,
+  }
+}
+
 function readPlugin(
   profileDir: string,
   name: string,
@@ -303,38 +465,34 @@ function readPlugin(
     return null
   }
 
-  const manifest = readJson(file)
-  if (!isPlainObject(manifest)) {
-    warn(name, `读不了 ${name} 的 package.json，跳过`)
+  const manifest = readJsonFile(file)
+  if (!manifest.ok) {
+    warn(name, `读不了 ${name} 的 package.json（${manifest.message}），跳过`)
+    return null
+  }
+  if (!isPlainObject(manifest.value)) {
+    warn(name, `${name} 的 package.json 不是一个对象，跳过`)
     return null
   }
 
-  const peers: Record<string, string> = {}
-  if (isPlainObject(manifest.peerDependencies)) {
-    for (const [peer, range] of Object.entries(manifest.peerDependencies)) {
-      if (typeof range !== 'string') continue
-      if (peer === DSH_PACKAGE || peer.startsWith(DSH_PEER_PREFIX)) peers[peer] = range
-    }
-  }
-
-  // 非法范围（不是字符串）不在这里判，也不丢掉：交给宿主，它一律算不满足
-  const engines = isPlainObject(manifest.engines) ? manifest.engines : {}
-  const enginesDsh =
-    engines.dsh === undefined ? undefined : typeof engines.dsh === 'string' ? engines.dsh : String(engines.dsh)
+  const requirements = requirementsOf(manifest.value)
+  const peerDependencies = requirements.peerDependencies
 
   return {
     id,
-    name: typeof manifest.name === 'string' && manifest.name !== '' ? manifest.name : name,
-    version: typeof manifest.version === 'string' ? manifest.version : '',
-    ...(enginesDsh === undefined ? {} : { enginesDsh }),
-    ...(peers[DSH_PACKAGE] === undefined ? {} : { peerDsh: peers[DSH_PACKAGE] }),
-    ...(Object.keys(peers).length === 0 ? {} : { peerDependencies: peers }),
+    name: typeof manifest.value.name === 'string' && manifest.value.name !== '' ? manifest.value.name : name,
+    version: typeof manifest.value.version === 'string' ? manifest.value.version : '',
+    ...(requirements.enginesDsh === undefined ? {} : { enginesDsh: requirements.enginesDsh }),
+    ...(peerDependencies?.[DSH_PACKAGE] === undefined ? {} : { peerDsh: peerDependencies[DSH_PACKAGE] }),
+    ...(peerDependencies === undefined ? {} : { peerDependencies }),
+    ...(requirements.problems.length === 0 ? {} : { manifestProblems: requirements.problems }),
   }
 }
 
 /**
  * 读 profile 里装了哪些插件：package.json 依赖 + 只挂在 cordis.patch.yml 的条目。
- * 单个插件读不到只回调 warning 并跳过，不中断整轮快检。
+ * 单个插件读不到只回调 warning 并跳过，不中断整轮快检；清单字段形状不对的留在
+ * `manifestProblems` 里，交给 compatFailures 报成 failure。
  */
 export async function readInstalled(
   profileDir: string,
@@ -344,13 +502,23 @@ export async function readInstalled(
     options.onWarning?.({ plugin, kind: 'compat', message })
   }
 
-  const profile = readJson(join(profileDir, 'package.json'))
-  if (!isPlainObject(profile)) return []
+  const profile = readJsonFile(join(profileDir, 'package.json'))
+  if (!profile.ok) {
+    // 文件不存在 = 这个 profile 还没装过插件；解析失败 = 我们看不到它装了啥，必须说出来
+    if (!profile.missing) {
+      warn('profile', `读不了 profile 的 package.json（${profile.message}），无法判断装了哪些插件`)
+    }
+    return []
+  }
+  if (!isPlainObject(profile.value)) {
+    warn('profile', 'profile 的 package.json 不是一个对象，无法判断装了哪些插件')
+    return []
+  }
 
   const plugins: InstalledPlugin[] = []
   const seen = new Set<string>()
 
-  const dependencies = isPlainObject(profile.dependencies) ? profile.dependencies : {}
+  const dependencies = isPlainObject(profile.value.dependencies) ? profile.value.dependencies : {}
   for (const name of Object.keys(dependencies).sort()) {
     const plugin = readPlugin(profileDir, name, name, warn, true)
     if (plugin === null) continue
@@ -358,13 +526,22 @@ export async function readInstalled(
     seen.add(name)
   }
 
-  // 只挂 patch、没写进依赖的插件（宿主自带的官方包解析不到，静默跳过）
+  // 只挂 patch、没写进依赖的插件。官方内置包解析不到是常态（静默），
+  // 第三方条目解析不到说明装坏了，要留信号。
   for (const entry of await patchEntries(profileDir)) {
     if (seen.has(entry.name)) continue
     const plugin = readPlugin(profileDir, entry.name, entry.id, warn, false)
-    if (plugin === null) continue
-    plugins.push(plugin)
-    seen.add(entry.name)
+    if (plugin !== null) {
+      plugins.push(plugin)
+      seen.add(entry.name)
+      continue
+    }
+    if (!entry.name.startsWith(OFFICIAL_SCOPE)) {
+      warn(
+        entry.name,
+        `patch 条目 ${entry.id} 指向 ${entry.name}，但它的 package.json 找不到（装了但没装好），跳过`,
+      )
+    }
   }
 
   return plugins

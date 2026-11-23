@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { compatFailures, readInstalled } from '../src/server/compat'
 import type { InstalledPlugin } from '../src/server/compat'
@@ -35,7 +35,8 @@ describe('compatFailures', () => {
   it('没有 engines.dsh 时按 dsh peer 依赖判', () => {
     const unmet = compatFailures([plugin({ name: 'x', peerDsh: '>=0.3.0' })], RUNTIME)
     expect(unmet).toHaveLength(1)
-    expect(unmet[0]).toMatchObject({ kind: 'compat', plugin: 'x', expected: '>=0.3.0' })
+    // peer 失败要带上包名，多 peer 时才知道是哪一条
+    expect(unmet[0]).toMatchObject({ kind: 'compat', plugin: 'x', expected: '@deepseek-ai/dsh >=0.3.0' })
 
     expect(compatFailures([plugin({ name: 'x', peerDsh: '>=0.2.0' })], RUNTIME)).toEqual([])
   })
@@ -56,6 +57,43 @@ describe('compatFailures', () => {
       expect(failures).toHaveLength(1)
       expect(failures[0]?.kind).toBe('compat')
       expect(failures[0]?.message).toContain('版本')
+    }
+  })
+
+  it('宿主包解析不到时返回明确失败，且不把负结果永久缓存', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-restart-host-'))
+    const saved = process.env.DSH_RESTART_DSH_DIR
+    try {
+      // 看起来像 dsh 安装根，但 app-boot 的入口文件故意不建 —— 加载必失败
+      await mkdir(join(root, 'node_modules', '@deepseek-ai', 'dsh-app-boot'), { recursive: true })
+      await writeFile(
+        join(root, 'package.json'),
+        JSON.stringify({ name: '@deepseek-ai/dsh', version: RUNTIME }),
+        'utf8',
+      )
+      await writeFile(
+        join(root, 'node_modules', '@deepseek-ai', 'dsh-app-boot', 'package.json'),
+        JSON.stringify({ name: '@deepseek-ai/dsh-app-boot', version: RUNTIME, main: 'lib/index.js' }),
+        'utf8',
+      )
+
+      process.env.DSH_RESTART_DSH_DIR = root
+      vi.resetModules()
+      const fresh = await import('../src/server/compat')
+
+      // 连打两次：第二次仍要重试并报失败，不能因为第一次失败就永久判「兼容」
+      for (let round = 0; round < 2; round += 1) {
+        const failures = fresh.compatFailures([plugin({ name: 'x', enginesDsh: '*' })], RUNTIME)
+        expect(failures).toHaveLength(1)
+        expect(failures[0]?.kind).toBe('compat')
+        expect(failures[0]?.message).toContain('DSH_RESTART_DSH_DIR')
+        expect(failures[0]?.message).toContain(root)
+      }
+    } finally {
+      if (saved === undefined) delete process.env.DSH_RESTART_DSH_DIR
+      else process.env.DSH_RESTART_DSH_DIR = saved
+      vi.resetModules()
+      await rm(root, { recursive: true, force: true })
     }
   })
 
@@ -160,7 +198,72 @@ describe('readInstalled', () => {
     expect(failures.map((failure) => failure.plugin).sort()).toEqual(['a', 'b'])
   })
 
-  it('profile 里没有 package.json 时返回空列表，不抛', async () => {
+  it('清单里的 engines / peerDependencies 形状不对时报明确失败，不静默判兼容', async () => {
+    await writeJson(join(dir, 'package.json'), { name: 'p', dependencies: { bad: '1.0.0' } })
+    await writeJson(join(dir, 'node_modules', 'bad', 'package.json'), {
+      name: 'bad',
+      version: '1.0.0',
+      // 宿主对这两种形状都会抛错并停用插件
+      engines: '>=0.2.0',
+      peerDependencies: { '@deepseek-ai/dsh': 1 },
+    })
+
+    const plugins = await readInstalled(dir)
+    expect(plugins[0]?.manifestProblems?.map((problem) => problem.field)).toEqual([
+      'engines',
+      'peerDependencies["@deepseek-ai/dsh"]',
+    ])
+
+    const failures = compatFailures(plugins, RUNTIME)
+    expect(failures).toHaveLength(2)
+    expect(failures.map((failure) => failure.expected)).toEqual([
+      'engines 为 对象',
+      'peerDependencies["@deepseek-ai/dsh"] 为 版本范围字符串',
+    ])
+    for (const failure of failures) expect(failure.message).toContain('停用')
+  })
+
+  it('patch 条目 id 带行尾注释也能认', async () => {
+    await writeJson(join(dir, 'package.json'), { name: 'p' })
+    await writeJson(join(dir, 'node_modules', 'commented', 'package.json'), {
+      name: 'commented',
+      version: '1.0.0',
+    })
+    await writeFile(
+      join(dir, 'cordis.patch.yml'),
+      ['- id: commented-row # 本地插件', '  name: "commented" # 备注'].join('\n'),
+      'utf8',
+    )
+
+    const plugins = await readInstalled(dir)
+    expect(plugins).toHaveLength(1)
+    expect(plugins[0]?.id).toBe('commented-row')
+  })
+
+  it('patch 只挂的第三方条目装不上时给 warning，官方内置包保持安静', async () => {
+    await writeJson(join(dir, 'package.json'), { name: 'p' })
+    await writeFile(
+      join(dir, 'cordis.patch.yml'),
+      ['- id: ghost-row', '  name: ghost-plugin', '- id: host-row', '  name: "@deepseek-ai/dsh-web"'].join('\n'),
+      'utf8',
+    )
+    const warnings: Failure[] = []
+
+    const plugins = await readInstalled(dir, { onWarning: (failure) => warnings.push(failure) })
+
+    expect(plugins).toEqual([])
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toMatchObject({ kind: 'compat', plugin: 'ghost-plugin' })
+    expect(warnings[0]?.message).toContain('ghost-row')
+  })
+
+  it('profile 的 package.json 坏掉时给 warning；文件不存在时安静返回空列表', async () => {
     await expect(readInstalled(dir)).resolves.toEqual([])
+
+    await writeFile(join(dir, 'package.json'), '{ 半截', 'utf8')
+    const warnings: Failure[] = []
+    await expect(readInstalled(dir, { onWarning: (failure) => warnings.push(failure) })).resolves.toEqual([])
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toMatchObject({ kind: 'compat', plugin: 'profile' })
   })
 })
