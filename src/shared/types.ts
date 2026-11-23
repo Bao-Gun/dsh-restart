@@ -19,7 +19,13 @@ export interface PrecheckResult {
   ok: boolean
   /** 预检时算出的 profile 指纹，用来判断这条结果是否过期 */
   fingerprint: string
+  /** 拦重启的问题：只有「配置合不出来」和「试跑没起来」会落在这里 */
   failures: Failure[]
+  /**
+   * 不拦重启、但值得看一眼的提示（插件版本不符、某个插件没激活、清单读不动……）。
+   * 宿主碰到这些只会跳过那个插件，dsh web 照样起得来，所以不参与 ok 判定。
+   */
+  warnings?: Failure[]
   durationMs: number
 }
 

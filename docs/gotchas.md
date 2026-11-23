@@ -17,4 +17,6 @@
 - 插件模块解析不到（没装、软链断、产物缺）→ dsh web 仍能启动，只是 stderr 里一句 `1 entry did not activate`，侧栏少一颗按钮 → 失败模式是「按钮静默消失」，不是「起不来」；所以装完先看这一行，预检失败的文案也要讲明白是插件没加载（见上方 /health 那条）。
 - 宿主只报一条未激活时是单数 `1 entry did not activate`，正则只写 `entries` → 名单永远空，冒烟把「恰好一个插件装坏」判绿 → 单复数都要认（src/server/smoke.ts:46-47）；判绿前必须先看这一行。
 - 登录后 `dsh-daemon` 的 watchdog 每 10s 探活，它和 helper 的自拉起是两套锁（watchdog 看自己的 daemon 状态，helper 用 `restart.lock`）→ helper 杀掉旧 web 后可能与 watchdog 抢同一端口，日志里出现 `EADDRINUSE` 不等于插件坏了 → 确认最后只剩一个实例、/health 200 即可。
+- 菜单行注入带一条「没菜单就退到侧栏底部 `[data-slot="settings.launcher"]` 上方」的退路 → 实机上它插进 `div[data-slot="sidebar.settings"] > div.VOzbGW_triggerRow`，与「更多」并排成第二行，把「更多」挤没了 → 只在账号菜单里插；菜单没打开就什么都不插，MutationObserver 等它出现再补（src/client/inject.ts）。
+- 预检把插件级问题（版本不符、清单读不动、试跑里没激活）当失败 → 实机 `dsh-mcp-connector` 的 patch 条目指向一个没装好的包，预检永远红，人根本点不了重启，而 web 其实起得好好的 → 只有「配置合不出来」和「试启动起不来」拦重启，插件问题一律 `warnings` 提示（src/index.ts 的 `ok = configFailures.length === 0 && bootOk`）。
 - helper 是 detached 单进程，杀旧 web 后它自己崩了没人拉起；刚启动不到 15 秒时 daemon 还会 `restart skipped` 直接退 0 → 界面全无时只能终端救：`dsh-daemon status` → `dsh-daemon start` → 还不行 `dsh web` 前台看报错；实在不行把 profile 的 `cordis.patch.yml` 里 `restart-button` 那条 insert 块删掉再起（README「万一没回来」一节）。

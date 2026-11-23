@@ -614,7 +614,7 @@ describe('POST /dsh-restart/api/precheck', () => {
     })
   })
 
-  it('冒烟 ok 但出现基线之外的新条目：boot 阶段不通过，也不动基线', async () => {
+  it('试跑能起来时，没激活的插件只是提示，不拦重启', async () => {
     const fake = makeCtx({ profile: PROFILE })
     const writes: Array<Partial<LastRecord>> = []
     const { io } = makeIo({
@@ -625,16 +625,36 @@ describe('POST /dsh-restart/api/precheck', () => {
       },
     })
     const res = await call(createHandlers(fake.ctx, io).precheck, makeReq({ method: 'POST' }), makeRes())
-    const boot = ndjson(res).find((line) => line.stage === 'boot') as { ok: boolean; failures: Failure[]; added: string[] }
-    expect(boot.ok).toBe(false)
+    const boot = ndjson(res).find((line) => line.stage === 'boot') as { ok: boolean; failures: Failure[]; warnings: Failure[]; added: string[] }
+    // 服务起来了就通过：宿主只是跳过没激活的插件，web 照样能跑。
+    expect(boot.ok).toBe(true)
     expect(boot.added).toEqual(['new'])
-    expect(boot.failures.some((failure) => failure.plugin === 'new')).toBe(true)
+    expect(boot.failures).toEqual([])
+    expect(boot.warnings.some((failure) => failure.plugin === 'new')).toBe(true)
     expect(writes).toHaveLength(1)
-    expect(writes[0]?.baseline).toBeUndefined()
-    expect(writes[0]?.precheck).toMatchObject({ ok: false })
-    expect(writes[0]?.precheck?.failures.some((failure) => failure.plugin === 'new')).toBe(true)
-    // 未通过也同步指纹，只是基线不动（Task 2 的不变量）。
+    expect(writes[0]?.baseline).toEqual(['new', 'old'])
+    expect(writes[0]?.precheck).toMatchObject({ ok: true, failures: [] })
+    expect(writes[0]?.precheck?.warnings?.some((failure) => failure.plugin === 'new')).toBe(true)
     expect(writes[0]?.fingerprint).toBe(FP)
+  })
+
+  it('兼容性告警（缺包、版本不符）也只是提示', async () => {
+    const fake = makeCtx({ profile: PROFILE })
+    const { io } = makeIo({
+      // 实机就是这样：patch 里有条目、node_modules 里没这个包。
+      readInstalled: async (_dir, onWarning) => {
+        onWarning?.({ kind: 'compat', plugin: 'dsh-mcp-connector', message: '装了但没装好，跳过' })
+        return []
+      },
+      compatFailures: () => [{ kind: 'compat', plugin: 'x', message: 'engines.dsh 不满足' }],
+    })
+    const res = await call(createHandlers(fake.ctx, io).precheck, makeReq({ method: 'POST' }), makeRes())
+    const lines = ndjson(res)
+    const compat = lines.find((line) => line.stage === 'compat') as { ok: boolean; failures: Failure[]; warnings: Failure[] }
+    expect(compat.ok).toBe(true)
+    expect(compat.failures).toEqual([])
+    expect(compat.warnings).toHaveLength(2)
+    expect(lines.at(-1)).toMatchObject({ done: true, ok: true, saved: true })
   })
 
   it('快检失败后仍继续跑后面的阶段', async () => {

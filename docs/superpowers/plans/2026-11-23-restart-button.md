@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 在侧栏「更多」菜单倒数第二行加一颗「重启 dsh web」，点开先跑三段预检、通过后再重启。
+**Goal:** 在侧栏「更多」菜单倒数第二行加一颗「重启」，点开先跑三段预检、通过后再重启。（实机反馈后收敛：预检只拦「配置合不出来」与「试启动起不来」，插件问题只作提示；侧栏底部不做退路行。）
 
 **Architecture:** 一个 cordis 插件，宿主半边向 `ctx.webServer` 挂三条 `/dsh-restart/api/*` 路由（读状态、跑预检、触发重启），预检分快检与冒烟两段，冒烟克隆当前 profile 另起一个实例验证；浏览器半边是一段自包含的 DOM 脚本，往账号菜单弹层里插行并渲染弹窗。重启由脱离本进程的 helper 执行。
 

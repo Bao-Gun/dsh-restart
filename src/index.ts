@@ -235,6 +235,7 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
         ok: false,
         cancelled: true,
         failures: smokeResult?.failures ?? [],
+        warnings: [],
         entries: smokeResult?.failedEntries ?? [],
         added: [],
         health: smokeResult?.health ?? false,
@@ -255,17 +256,21 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
       const configFailures = await stage('config', () => io.runDumpConfig(profile.dir))
       write({ stage: 'config', ok: configFailures.length === 0, failures: configFailures })
 
-      // 快检 B：装着的插件跟当前 dsh 版本兼不兼容。清单告警也算失败，不能静默放行。
+      // 快检 B：装着的插件跟当前 dsh 版本兼不兼容。
+      //
+      // 这一段的结论**不拦重启**：宿主遇到版本不符、清单读不动的插件只会跳过它，
+      // dsh web 照样起得来（实机上 dsh-mcp-connector 缺包也一直是这个状态）。
+      // 拦下来只会让预检永远过不去，让人没法重启；所以全部降级成「提示」，
+      // 真起不来的情况交给下面的试启动去抓。
       const version = io.runtimeVersion()
-      const warnings: Failure[] = []
-      let compat: Failure[] = []
+      const pluginWarnings: Failure[] = []
       try {
-        const plugins = await io.readInstalled(profile.dir, (failure) => warnings.push(failure))
-        compat = [...warnings, ...io.compatFailures(plugins, version ?? '')]
+        const plugins = await io.readInstalled(profile.dir, (failure) => pluginWarnings.push(failure))
+        pluginWarnings.push(...io.compatFailures(plugins, version ?? ''))
       } catch (error) {
-        compat = [...warnings, { kind: 'compat', message: '兼容性检查失败：' + messageOf(error) }]
+        pluginWarnings.push({ kind: 'compat', message: '兼容性检查没跑完：' + messageOf(error) })
       }
-      write({ stage: 'compat', ok: compat.length === 0, failures: compat })
+      write({ stage: 'compat', ok: true, failures: [], warnings: pluginWarnings })
 
       if (cancelled) {
         cancelledPayload()
@@ -292,25 +297,32 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
       }
       const previous = await safeReadLast(io, io.logDir)
       const { added } = diffFailedEntries(smoke.failedEntries, previous.baseline ?? [])
-      const addedFailures: Failure[] = added.map((entry) => ({
+      const newEntrySet = new Set(added)
+      // 没激活的插件同样是「提示」：试跑已经证明服务能起来，起不来会在 smoke.failures 里。
+      // 与上次通过的基线不同的那几条再额外标一句，方便看出「这次新弄坏的」是谁。
+      const bootWarnings: Failure[] = smoke.failedEntries.map((entry) => ({
         plugin: entry,
         kind: 'boot',
-        message: `${entry} 在试跑里没有激活，而且不在上次通过的基线里`,
+        message: newEntrySet.has(entry)
+          ? `${entry} 没有激活（不在上次通过的基线里）`
+          : `${entry} 没有激活（上次通过时也是这样）`,
       }))
-      const bootFailures = [...smoke.failures, ...addedFailures]
-      // runSmoke.ok 已包含 health 200 与「临时目录 / 进程组清理干净」；新增失败再看差分。
-      const bootOk = smoke.ok && added.length === 0
+      const bootFailures = smoke.failures
+      // runSmoke.ok 已包含 health 200 与「临时目录 / 进程组清理干净」。
+      const bootOk = smoke.ok && smoke.health && bootFailures.length === 0
       write({
         stage: 'boot',
         ok: bootOk,
         failures: bootFailures,
+        warnings: bootWarnings,
         entries: smoke.failedEntries,
         added,
         health: smoke.health,
       })
 
-      const ok = configFailures.length === 0 && compat.length === 0 && bootOk
-      const failures = [...configFailures, ...compat, ...bootFailures]
+      const ok = configFailures.length === 0 && bootOk
+      const failures = [...configFailures, ...bootFailures]
+      const warnings = [...pluginWarnings, ...bootWarnings]
 
       let fingerprint: string | null = null
       try {
@@ -331,6 +343,7 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
           ok,
           fingerprint,
           failures,
+          warnings,
           durationMs: Math.max(0, Date.now() - startedAt),
         }
         try {

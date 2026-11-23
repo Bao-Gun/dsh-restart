@@ -213,11 +213,22 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
     view.failures.appendChild(item)
   }
 
-  const renderStage = (stage: Stage, ok: boolean, failures: Failure[]): void => {
+  /** 提示项：不拦重启，只是让人看见（例如某个插件早就没激活）。 */
+  const appendWarning = (failure: Failure): void => {
+    if (view === null) return
+    const item = doc.createElement('li')
+    item.className = 'dsh-restart-warning'
+    item.setAttribute('data-dsh-restart-warning', '1')
+    item.textContent = failureText(failure)
+    view.failures.appendChild(item)
+  }
+
+  const renderStage = (stage: Stage, ok: boolean, failures: Failure[], warnings: Failure[] = []): void => {
     if (view === null) return
     const element = view.stages[stage]
     element.dataset.state = ok ? 'ok' : 'fail'
-    element.textContent = STAGE_LABEL[stage] + ' · ' + (ok ? '通过' : '未通过（' + failures.length + ' 项）')
+    const note = warnings.length > 0 ? '（' + warnings.length + ' 条提示）' : ''
+    element.textContent = STAGE_LABEL[stage] + ' · ' + (ok ? '通过' + note : '未通过（' + failures.length + ' 项）')
   }
 
   const resetView = (target: DialogView): void => {
@@ -259,6 +270,7 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
     const results: Partial<Record<Stage, boolean>> = {}
     let doneError: string | undefined
     let sawDone = false
+    let warnCount = 0
 
     try {
       const response = await request(API.precheck, 'POST', signal)
@@ -280,15 +292,18 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
         if (stage !== 'config' && stage !== 'compat' && stage !== 'boot') return
         const ok = record.ok === true
         const failures = parseFailures(record.failures)
+        const warnings = parseFailures(record.warnings)
+        warnCount += warnings.length
         results[stage] = ok
-        renderStage(stage, ok, failures)
+        renderStage(stage, ok, failures, warnings)
         if (!ok) failures.forEach(appendFailure)
+        warnings.forEach(appendWarning)
       }, signal)
 
       if (!live(target, ticket)) return
       const allOk = sawDone && STAGES.every((stage) => results[stage] === true) && doneError === undefined
       localPassed = allOk
-      if (allOk) setNotice('检查全过，可以重启。', 'ok', target)
+      if (allOk) setNotice(warnCount > 0 ? '检查通过，可以重启（' + warnCount + ' 条提示见上）。' : '检查全过，可以重启。', 'ok', target)
       else setNotice(doneError ?? '预检没全过：先按上面的失败项修，再重试。', 'error', target)
     } catch (error) {
       if (!live(target, ticket) || isAbort(error)) return
@@ -474,7 +489,7 @@ function buildDialog(doc: Document, handlers: DialogHandlers): DialogView {
   const title = doc.createElement('h2')
   title.className = 'dsh-restart-title'
   title.id = 'dsh-restart-title'
-  title.textContent = '重启 dsh web'
+  title.textContent = '重启'
   const closeButton = doc.createElement('button')
   closeButton.type = 'button'
   closeButton.className = 'dsh-restart-close'
@@ -484,11 +499,6 @@ function buildDialog(doc: Document, handlers: DialogHandlers): DialogView {
   head.appendChild(title)
   head.appendChild(closeButton)
   panel.appendChild(head)
-
-  const hint = doc.createElement('p')
-  hint.className = 'dsh-restart-hint'
-  hint.textContent = '装完插件看到上一次「通过」最危险：插件换了，上次结论就不作数。以本次检查为准。'
-  panel.appendChild(hint)
 
   // ① 端口与健康
   const serviceSection = section(doc, '服务')
@@ -514,7 +524,7 @@ function buildDialog(doc: Document, handlers: DialogHandlers): DialogView {
   const checkSection = section(doc, '模拟检查')
   const checkHint = doc.createElement('div')
   checkHint.className = 'dsh-restart-hint'
-  checkHint.textContent = '照着重启后的流程跑一遍：解析配置 → 校验插件版本 → 试启动并探活。'
+  checkHint.textContent = '照着重启后的流程跑一遍：解析配置 → 看插件版本 → 试启动并探活。只有配置解析不了、或试启动起不来才会拦。'
   checkSection.body.appendChild(checkHint)
   const stages = {} as Record<Stage, HTMLElement>
   for (const stage of STAGES) {
@@ -550,7 +560,7 @@ function buildDialog(doc: Document, handlers: DialogHandlers): DialogView {
   restart.type = 'button'
   restart.className = 'dsh-restart-btn dsh-restart-btn--primary'
   restart.setAttribute('data-dsh-restart-restart', '1')
-  restart.textContent = '重启 dsh web'
+  restart.textContent = '重启'
   restart.disabled = true
   restart.addEventListener('click', () => {
     if (restart.disabled) return
@@ -609,8 +619,12 @@ function lastText(payload: StatusPayload): string {
   const precheck = last?.precheck
   if (precheck === undefined || precheck === null) return '还没有预检记录'
   const failures = Array.isArray(precheck.failures) ? precheck.failures.length : 0
+  const warnings = Array.isArray(precheck.warnings) ? precheck.warnings.length : 0
   const head = formatTime(precheck.at) + ' 预检' + (precheck.ok === true ? '通过' : '未通过')
-  const detail = failures > 0 ? ' · ' + failures + ' 项失败' : ''
+  const parts: string[] = []
+  if (failures > 0) parts.push(failures + ' 项失败')
+  if (warnings > 0) parts.push(warnings + ' 条提示')
+  const detail = parts.length > 0 ? ' · ' + parts.join(' / ') : ''
   const stale = payload.stale === true ? '（已过期，需重新检查）' : ''
   return head + detail + stale
 }

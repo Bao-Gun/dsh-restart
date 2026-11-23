@@ -133,6 +133,18 @@ export const dialogCss = `
   white-space: pre-wrap;
   word-break: break-word;
 }
+.dsh-restart-warning {
+  margin-top: 4px;
+  padding: 6px 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--dsw-alias-state-warning-primary, #a16207);
+  background: var(--dsw-alias-bg-layer-2, rgba(0, 0, 0, 0.03));
+  border-radius: 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .dsh-restart-actions {
   display: flex;
   flex-wrap: wrap;

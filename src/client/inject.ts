@@ -1,5 +1,5 @@
 /**
- * 账号菜单注入：在侧栏「更多」弹层的倒数第二行插一颗「重启 dsh web」。
+ * 账号菜单注入：在侧栏「更多」弹层的倒数第二行插一颗「重启」。
  *
  * 为什么是 DOM 注入而不是插槽：这个入口在账号菜单的 menuitem 列里，
  * 宿主没有为「往这个菜单里加行」开插槽。所以按实机 DOM 结构补挂，
@@ -8,17 +8,19 @@
  * - 每行是 `<div class="_itemWrap_…">` 包一个 `<button role="menuitem">`；
  * - 弹层关掉时整棵节点被移除，所以必须用 MutationObserver 在每次重开时补挂。
  *
+ * 只往菜单里插，**不**在侧栏底部另起一行：实机上那样会和「更多」并排成两行，
+ * 把「更多」挤走（2026-11-23 现场反馈）。菜单没开就没入口，这是可以接受的代价。
+ *
  * 行样式不自定义：class 直接抄相邻 menuitem，配色/尺寸/间距跟着宿主设计系统走。
  */
 
 /** MutationObserver 的防抖窗口；React 一次重渲染会连发很多条 mutation。 */
 export const DEFAULT_DEBOUNCE_MS = 100
 /** 菜单行文案。 */
-export const MENU_ROW_LABEL = '重启 dsh web'
+export const MENU_ROW_LABEL = '重启'
 
 const ROW_ATTR = 'data-dsh-restart-row'
 const WRAP_ATTR = 'data-dsh-restart-wrap'
-const LAUNCHER_ROW_ATTR = 'data-dsh-restart-launcher-row'
 const ACCOUNT_MENU_LABEL = /设置|Settings|联系|Contact|退出|Sign out|登录|Sign in/
 
 export interface InjectMenuRowOptions {
@@ -56,12 +58,7 @@ export function injectMenuRow(doc: Document, opts: InjectMenuRowOptions): () => 
 
   const ensureRow = (): void => {
     if (disposed || doc.body === null) return
-    if (injectIntoMenu(doc, opts.onOpen)) {
-      // 菜单挂上了就不该再留退路那条，否则会有两个入口。
-      removeLauncherRows(doc)
-      return
-    }
-    injectIntoLauncher(doc, opts.onOpen)
+    injectIntoMenu(doc, opts.onOpen)
   }
 
   const schedule = (): void => {
@@ -104,7 +101,6 @@ export function injectMenuRow(doc: Document, opts: InjectMenuRowOptions): () => 
       onDomReady = null
     }
     removeMenuRows(doc)
-    removeLauncherRows(doc)
   }
 }
 
@@ -126,50 +122,6 @@ function injectIntoMenu(doc: Document, onOpen: () => void): boolean {
     return true
   }
   return false
-}
-
-/** 没有菜单可插时，退到账号 launcher 上方插一条同样式的行。返回是否插入/已存在。 */
-function injectIntoLauncher(doc: Document, onOpen: () => void): boolean {
-  const launcher = doc.querySelector('[data-slot="settings.launcher"]')
-  if (launcher === null) return false
-  const parent = launcher.parentElement
-  if (parent === null) return false
-  // 幂等看整棵父节点：宿主可能在退路行与 launcher 之间插包裹层或分隔线，
-  // 只看 previousElementSibling 会插出第二行。
-  const existing = Array.from(parent.querySelectorAll('[' + LAUNCHER_ROW_ATTR + ']'))
-  if (existing.length > 0) {
-    for (const extra of existing.slice(1)) extra.remove()
-    return true
-  }
-
-  const trigger = launcher.querySelector('button')
-  const row = doc.createElement('button')
-  row.type = 'button'
-  row.setAttribute(LAUNCHER_ROW_ATTR, '1')
-  row.setAttribute('aria-label', MENU_ROW_LABEL)
-  row.title = MENU_ROW_LABEL
-  if (trigger !== null) {
-    row.className = trigger.className
-    const collapsed = trigger.getAttribute('data-collapsed')
-    if (collapsed !== null) row.setAttribute('data-collapsed', collapsed)
-    const signedOut = trigger.getAttribute('data-signed-out')
-    if (signedOut !== null) row.setAttribute('data-signed-out', signedOut)
-  }
-  const icon = doc.createElement('span')
-  icon.setAttribute('aria-hidden', 'true')
-  icon.innerHTML = REFRESH_ICON
-  row.appendChild(icon)
-  if (!row.hasAttribute('data-collapsed') || row.getAttribute('data-collapsed') !== 'true') {
-    const label = doc.createElement('span')
-    const sourceLabel = trigger?.querySelector('span[class]')
-    if (sourceLabel !== null && sourceLabel !== undefined) label.className = sourceLabel.className
-    label.textContent = MENU_ROW_LABEL
-    row.appendChild(label)
-  }
-  row.addEventListener('click', () => onOpen())
-
-  parent.insertBefore(row, launcher)
-  return true
 }
 
 /** 只认账号菜单：排除右键/下拉菜单，并要求标签里出现「设置 / 退出」这类词。 */
@@ -230,6 +182,3 @@ function removeMenuRows(doc: Document): void {
   }
 }
 
-function removeLauncherRows(doc: Document): void {
-  for (const row of Array.from(doc.querySelectorAll('[' + LAUNCHER_ROW_ATTR + ']'))) row.remove()
-}

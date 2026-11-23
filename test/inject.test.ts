@@ -71,7 +71,7 @@ describe('injectMenuRow：插在账号菜单倒数第二行', () => {
       const items = Array.from(document.querySelectorAll('[role="menu"] button[role="menuitem"]'))
       expect(items).toHaveLength(4)
       expect(items[2]?.hasAttribute('data-dsh-restart-row')).toBe(true)
-      expect(items[2]?.textContent).toContain('重启 dsh web')
+      expect(items[2]?.textContent).toBe('重启')
       expect(items[3]?.textContent).toContain('退出登录')
       // 外面包一层和相邻行一样的 itemWrap，行高/间距才能对上。
       expect(items[2]?.parentElement?.className).toBe(ITEM_WRAP)
@@ -140,7 +140,7 @@ describe('injectMenuRow：插在账号菜单倒数第二行', () => {
   })
 })
 
-describe('injectMenuRow：找不到菜单时的退路', () => {
+describe('injectMenuRow：没有菜单时什么都不插', () => {
   beforeEach(() => {
     document.body.innerHTML = fallbackOnly()
   })
@@ -149,28 +149,29 @@ describe('injectMenuRow：找不到菜单时的退路', () => {
     document.body.innerHTML = ''
   })
 
-  it('退到 [data-slot="settings.launcher"] 上方插一条同样式行', () => {
-    const dispose = injectMenuRow(document, { onOpen: () => undefined })
+  // 侧栏底部那条退路会把「更多」挤成第二行（实机上「更多」直接不见了），
+  // 所以菜单没打开时宁可什么都不插，等菜单出现再补。
+  it('侧栏底部不另起一行', () => {
+    const dispose = injectMenuRow(document, { onOpen: () => undefined, debounceMs: 5 })
     try {
       const launcher = document.querySelector('[data-slot="settings.launcher"]')
-      const row = launcher?.previousElementSibling
-      expect(row?.hasAttribute('data-dsh-restart-launcher-row')).toBe(true)
-      expect(row?.textContent).toBe('重启 dsh web')
-      expect(row?.className).toContain('yHnPSG_trigger')
+      expect(launcher?.previousElementSibling?.hasAttribute('data-dsh-restart-launcher-row')).not.toBe(true)
+      expect(document.querySelectorAll('[data-dsh-restart-launcher-row]')).toHaveLength(0)
       expect(rows(document)).toHaveLength(0)
     } finally {
       dispose()
     }
   })
 
-  it('退路同样幂等', () => {
-    const disposeA = injectMenuRow(document, { onOpen: () => undefined })
-    const disposeB = injectMenuRow(document, { onOpen: () => undefined })
+  it('菜单后来才出现，也能补挂进去', async () => {
+    const dispose = injectMenuRow(document, { onOpen: () => undefined, debounceMs: 5 })
     try {
-      expect(document.querySelectorAll('[data-dsh-restart-launcher-row]')).toHaveLength(1)
+      expect(rows(document)).toHaveLength(0)
+      document.body.innerHTML = fallbackOnly() + accountMenu()
+      await wait(60)
+      expect(rows(document)).toHaveLength(1)
     } finally {
-      disposeB()
-      disposeA()
+      dispose()
     }
   })
 })
@@ -470,6 +471,61 @@ describe('mountDialog：五段与状态', () => {
     precheckButton().click()
     await waitFor(() => restartButton().disabled === false)
     expect(restartButton().disabled).toBe(false)
+  })
+
+  it('插件问题只作提示：阶段仍算通过，提示单独列出，按钮可用', async () => {
+    const lines = [
+      JSON.stringify({ stage: 'config', ok: true, failures: [] }),
+      JSON.stringify({
+        stage: 'compat',
+        ok: true,
+        failures: [],
+        warnings: [{ kind: 'compat', plugin: 'dsh-mcp-connector', message: '装了但没装好，跳过' }],
+      }),
+      JSON.stringify({
+        stage: 'boot',
+        ok: true,
+        failures: [],
+        warnings: [{ kind: 'boot', plugin: 'stale-plugin', message: '没有激活（不在上次通过的基线里）' }],
+        entries: ['stale-plugin'],
+        added: ['stale-plugin'],
+        health: true,
+      }),
+      JSON.stringify({ done: true, ok: true, saved: true, fingerprint: 'fp-1' }),
+    ].join('\n') + '\n'
+
+    const { fetchImpl } = fakeFetch({
+      '/dsh-restart/api/status': jsonResponse(statusPayload({ last: {} })),
+      '/dsh-restart/api/precheck': ndjsonResponse(lines, 3),
+    })
+    const dialog = mountDialog(document, { fetchImpl })
+    dialog.open()
+    await settle()
+    precheckButton().click()
+    await waitFor(() => restartButton().disabled === false)
+
+    expect(textOf('[data-dsh-restart-stage="compat"]')).toContain('通过')
+    expect(textOf('[data-dsh-restart-stage="compat"]')).toContain('1 条提示')
+    expect(textOf('[data-dsh-restart-stage="boot"]')).toContain('通过')
+    const warnings = document.querySelectorAll('[data-dsh-restart-warning]')
+    expect(warnings).toHaveLength(2)
+    expect(warnings[0]?.textContent).toContain('dsh-mcp-connector')
+    expect(warnings[1]?.textContent).toContain('stale-plugin')
+    expect(document.querySelectorAll('[data-dsh-restart-failure]')).toHaveLength(0)
+    expect(restartButton().disabled).toBe(false)
+    expect(noticeText()).toContain('2 条提示')
+  })
+
+  it('标题和主按钮都叫「重启」，没有那句「最危险」小字', async () => {
+    const { fetchImpl } = fakeFetch({ '/dsh-restart/api/status': jsonResponse(statusPayload({ last: {} })) })
+    const dialog = mountDialog(document, { fetchImpl })
+    dialog.open()
+    await settle()
+
+    expect(textOf('.dsh-restart-title')).toBe('重启')
+    expect(restartButton().textContent).toBe('重启')
+    expect(document.body.textContent).not.toContain('最危险')
+    expect(document.body.textContent).not.toContain('本次检查为准')
   })
 
   it('「我知道风险，直接重启」走 confirm() 二次确认', async () => {
