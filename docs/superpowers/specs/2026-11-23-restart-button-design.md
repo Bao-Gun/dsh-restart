@@ -1,6 +1,6 @@
 # 重启按钮（侧栏「更多」倒数第二行）设计
 
-日期：2026-11-23 · 项目：dsh-restart · 状态：实现中（Task 3 已落兼容性快检：宿主判定 + fail-closed；Task 5 已落重启 helper：daemon 优先、自拉起兜底）
+日期：2026-11-23 · 项目：dsh-restart · 状态：实现中（Task 3 已落兼容性快检：宿主判定 + fail-closed；Task 5 已落重启 helper：daemon 优先、自拉起兜底；Task 6 已落三条路由与请求门）
 
 ## 现在是什么情况
 
@@ -48,7 +48,7 @@
 - **端口冲突不算红。** 试跑环境与线上必然抢 18787、18887 这类固定端口，冲突进基线，不阻断。
 - **不回写运行中的 profile。** 预检全程不碰 `~/.dsh/profiles/web`。
 - **重启的执行者是 helper，不是本进程。** daemon 被暂停或没装时会先 SIGTERM 再等端口，本进程会在半路死掉、拿不到结果；所以 fork 一个脱离的 helper，它先试 daemon，端口没回来就自己 `--no-open` 拉起，顺带压掉 daemon 默认开新标签页的行为。自拉起的命令是 `dsh --profile <name> --port <port> --no-open`：profile 只能指定一次，位置参数 `web` 和 `--profile web` 同时出现会被 CLI 拒绝。总预算是 `waitMs`（默认 60s）+ 插件宽限（默认 5s），自拉起和接管只用剩余额度，落在弹窗 90 秒超时之内。
-- **两个 POST 不收无来历的请求**：校验 `Origin`/`Host` 与自身一致，且要求自定义头 `X-DSH-Restart`（跨站发不出来）。本机单用户也照做——将来开到 LAN 或隧道后面，这就是远程关机按钮。
+- **两个 POST 不收无来历的请求**：先过宿主 `connection.requestRejection`（Host/Origin 与浏览器/API 凭据），再要求 `Origin` 与 `Host` 一致、且带自定义头 `X-DSH-Restart: 1`（跨站发不出来）。本机单用户也照做——将来开到 LAN 或隧道后面，这就是远程关机按钮。唯一例外是 helper 重启后的只读就绪探针：回环地址 + `GET /dsh-restart/api/status` + 带头 + 无 Origin 时，宿主的 401 被当作放行；`precheck` / `restart` 永不享受这个例外。
 - **上次结果会过期。** `last.json` 带 profile 指纹（lockfile 摘要 + dsh 版本）；对不上就显「已过期，需重新检查」，按钮回到灰禁。装完插件看到的是上一次的「通过」，正是最危险的那一刻。
 - **判定回来不能只看 `/health`**：插件自己的 status 也要 200；探不到就报「插件未加载」，不能显示「已重启」——用错 profile/DSH_HOME 的进程同样 200 `/health`，但侧栏里没有按钮。
 
