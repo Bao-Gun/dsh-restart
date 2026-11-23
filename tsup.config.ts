@@ -6,6 +6,9 @@ import { defineConfig } from 'tsup'
 // - 客户端入口 src/client/index.ts 跑在浏览器里，用 classic script 加载，
 //   必须产出 iife，并用 banner/footer 把整个模块体包进宿主的 factory，
 //   保证首行自注册、模块体副作用延迟到 materialize 时执行。
+// 注意：产物目录清理由 package.json 的 build 脚本负责（rm -rf lib）。
+// tsup 9 对数组配置是并发的（Promise.all），任何一份配置 clean: true 都会
+// 在另一份写完之后把它删掉，所以这里两份都不设 clean。
 export default defineConfig([
   {
     entry: { index: 'src/index.ts' },
@@ -13,7 +16,6 @@ export default defineConfig([
     platform: 'node',
     target: 'node22',
     outDir: 'lib',
-    clean: true,
     splitting: false,
     sourcemap: true,
     external: [/^@deepseek-ai\//],
@@ -24,7 +26,6 @@ export default defineConfig([
     platform: 'browser',
     target: 'es2022',
     outDir: 'lib',
-    clean: false,
     splitting: false,
     sourcemap: true,
     outExtension: () => ({ js: '.js' }),
