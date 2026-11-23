@@ -666,9 +666,14 @@ function passedByPayload(payload: StatusPayload): boolean {
   return precheck !== undefined && precheck !== null && precheck.ok === true && payload.stale !== true && payload.restarting !== true
 }
 
+/** 落盘的 `at` 是 UTC ISO（服务端 `toISOString()`）；这里必须转成本机时区再显示。 */
 function formatTime(at: string | undefined): string {
   if (typeof at !== 'string' || at.length < 16) return '之前'
-  return at.slice(0, 16).replace('T', ' ')
+  const date = new Date(at)
+  if (Number.isNaN(date.getTime())) return '之前'
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  return String(date.getFullYear()) + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate())
+    + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes())
 }
 
 function failureText(failure: Failure): string {

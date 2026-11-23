@@ -29,3 +29,6 @@
 - 以为 `DSH_DAEMON_OPEN_BROWSER=0` 能让 daemon 别开浏览器 → `~/.dsh/daemon/watchdog.js:227` 是 `const OPEN_BROWSER = 1;`，这个环境变量压根没接，唯一的闸口是 `watchdog.js:793` 的 `else if (process.env.SSH_CONNECTION || process.env.SSH_TTY)`，而那是个生成文件、`dsh_daemon_reinstall` 会覆盖 → 在 helper 里派生 daemon 时自己塞 `DSH_DAEMON_OPEN_BROWSER=0` 和一条假 `SSH_CONNECTION`（`src/server/restart.ts` 的 `daemonRestartEnv`），页面交给弹窗自己刷新。
 - 用 `ps -o lstart=` 取进程启动时间做身份比对 → 中文 locale（`LANG=zh_CN.UTF-8`）下 macOS 打成 `一 11/23 22:40:14 2026`，与英文月份正则对不上，所有 pid 身份都变成「无法确认」，陈旧试跑的清扫因此不再发信号，孤儿实例带着端口一直活着 → 调 `ps` 时钉住 `LC_ALL=C`、`LANG=C`（`src/server/smoke.ts` 的 `probeProcessIdentity`）。
 
+
+- 「上次结果」直接 `at.slice(0,16)` 切 UTC ISO 字符串 → UTC+8 机器上显示的时间永远少 8 小时（真机显示 14:26，实际 22:26） → `at` 是服务端 `toISOString()` 落的 UTC，必须 `new Date(at)` 后按本机时区的 `getFullYear/getHours` 拼字符串（`src/client/dialog.ts` 的 `formatTime`）。
+

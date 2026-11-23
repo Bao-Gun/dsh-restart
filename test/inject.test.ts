@@ -422,6 +422,27 @@ describe('mountDialog：五段与状态', () => {
     expect((document.querySelector('[data-dsh-restart-restart]') as HTMLButtonElement | null)?.disabled).toBe(false)
   })
 
+  it('上次结果的时间按本机时区显示，不直接切 ISO 字符串', async () => {
+    // 服务端落盘的是 UTC ISO；直接 slice 会在 UTC+8 机器上少 8 小时（2026-11-23 真机：显示 14:26，实际 22:26）。
+    const at = '2026-11-23T15:03:37.011Z'
+    const { fetchImpl } = fakeFetch({
+      '/dsh-restart/api/status': jsonResponse(statusPayload({
+        last: { precheck: { at, ok: true, fingerprint: 'fp-1', failures: [], durationMs: 1200 } },
+      })),
+    })
+    const dialog = mountDialog(document, { fetchImpl })
+    dialog.open()
+    await settle()
+
+    const local = new Date(at)
+    const pad = (n: number): string => String(n).padStart(2, '0')
+    const expected = String(local.getFullYear()) + '-' + pad(local.getMonth() + 1) + '-' + pad(local.getDate())
+      + ' ' + pad(local.getHours()) + ':' + pad(local.getMinutes())
+    const rendered = textOf('[data-dsh-restart-last]')
+    expect(rendered).toContain(expected)
+    if (local.getTimezoneOffset() !== 0) expect(rendered).not.toContain(at.slice(0, 16).replace('T', ' '))
+  })
+
   it('指纹过期时禁用重启按钮并提示重新检查', async () => {
     const { fetchImpl } = fakeFetch({
       '/dsh-restart/api/status': jsonResponse(statusPayload({
