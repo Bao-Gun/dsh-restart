@@ -107,11 +107,11 @@
 - Test: `test/restart.test.ts`
 
 **Interfaces:**
-- Produces: `waitForPort(port: number, timeoutMs: number, probe?: (port: number) => Promise<boolean>): Promise<boolean>`；`pickRoute(daemonInstalled: boolean, paused: boolean): 'daemon' | 'helper'`；`isRefused(lockPath: string): Promise<boolean>`；`scheduleRestart(opts: { port: number; profileDir: string; logDir: string }): void`（`spawn(process.execPath, [helperPath], { detached: true, stdio: 'ignore' }).unref()`）；`runRestartHelper(opts: { port: number; profileDir: string; waitMs?: number }): Promise<0 | 1>`。
+- Produces: `waitForPort(port: number, timeoutMs: number, probe?: (port: number) => Promise<boolean>): Promise<boolean>`；`pickRoute(daemonInstalled: boolean, paused: boolean): 'daemon' | 'helper'`；`isRefused(lockPath: string): Promise<boolean>`；`scheduleRestart(opts: { port: number; profileDir: string; logDir: string; dshHome?: string; profileName?: string; dshBin?: string }): void`（`spawn(process.execPath, [helperPath], { detached: true, stdio: 'ignore' }).unref()`）；`runRestartHelper(opts: { port: number; profileDir: string; waitMs?: number; dshHome?: string; profileName?: string; dshBin?: string; pluginGraceMs?: number }): Promise<0 | 1>`。
 
 - [x] **Step 1: 写失败测试**：`pickRoute(false,false)==='helper'`、`pickRoute(true,true)==='helper'`、`pickRoute(true,false)==='daemon'`；已有 lock 文件时 `isRefused` 为 `true`；`waitForPort(port, 200, fakeFetch)` 在探活一直失败时返回 `false` 且耗时不超过上界。
 - [x] **Step 2: 跑测试，确认失败。**
-- [x] **Step 3: 实现**。helper 流程：拿 lock → `spawn('dsh-daemon',['restart'])` 并轮询端口至上界（默认 60s）→ 端口没回来则 `spawn('dsh',['--profile','web','--port',String(port),'--no-open'],{detached:true, env:{...process.env, DSH_DAEMON_OPEN_BROWSER:'0'}})`（profile 只能用一种写法：位置参数 `web` 和 `--profile web` 同时出现会被 dsh 拒绝）→ 全程写 `~/.dsh/dsh-restart/helper-<ts>.log` → 释放 lock。
+- [x] **Step 3: 实现**。helper 流程：拿 lock → `spawn('dsh-daemon',['restart'])` 并轮询端口至上界（默认 60s）→ 端口没回来则 `spawn('dsh',['--profile','web','--port',String(port),'--no-open'],{detached:true, env:{...process.env, DSH_DAEMON_OPEN_BROWSER:'0'}})`（profile 只能用一种写法：位置参数 `web` 和 `--profile web` 同时出现会被 dsh 拒绝）→ 全程写 `~/.dsh/dsh-restart/helper-<ts>.log` → 释放 lock。成功判据是两段：`/health` 200 之后，`GET /dsh-restart/api/status` 也 200 才算回来；第二段超时报「插件未加载」。profile 名 / DSH_HOME / dsh 路径由调用方显式传入（写进 `DSH_RESTART_PROFILE_NAME` / `DSH_RESTART_DSH_HOME` / `DSH_RESTART_DSH_BIN`），缺参才从 `profileDir` 反推。
 - [x] **Step 4: 跑测试，确认通过。**
 - [x] **Step 5: Commit** `feat: 重启 helper（daemon 优先，自拉起兜底）`
 

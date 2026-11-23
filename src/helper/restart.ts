@@ -4,6 +4,7 @@
  * 只做「读环境 -> 调 runRestartHelper -> exit code」；重启状态机都在
  * src/server/restart.ts。测试 import 本文件时不会自动执行（见文件末尾的入口判断）。
  */
+import { appendFileSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -16,6 +17,13 @@ export interface HelperConfig {
   logDir: string
   waitMs?: number
   webPid?: number
+  /** 显式传入时优先于从 profileDir 反推。 */
+  dshHome?: string
+  /** 显式传入时优先于 basename(profileDir)。 */
+  profileName?: string
+  dshBin?: string
+  /** 插件状态路由的宽限，见 PLUGIN_READY_GRACE_MS。 */
+  pluginGraceMs?: number
 }
 
 export type HelperConfigParse = { ok: true; config: HelperConfig } | { ok: false; error: string }
@@ -62,6 +70,24 @@ export function parseHelperConfig(env: Record<string, string | undefined>): Help
     config.waitMs = waitMs
   }
 
+  const dshHome = env.DSH_RESTART_DSH_HOME?.trim() ?? ''
+  if (dshHome !== '') config.dshHome = dshHome
+
+  const profileName = env.DSH_RESTART_PROFILE_NAME?.trim() ?? ''
+  if (profileName !== '') config.profileName = profileName
+
+  const dshBin = env.DSH_RESTART_DSH_BIN?.trim() ?? ''
+  if (dshBin !== '') config.dshBin = dshBin
+
+  const rawGrace = env.DSH_RESTART_PLUGIN_GRACE_MS
+  if (rawGrace !== undefined && rawGrace.trim() !== '') {
+    const pluginGraceMs = parsePositiveInt(rawGrace)
+    if (pluginGraceMs === null) {
+      return { ok: false, error: `DSH_RESTART_PLUGIN_GRACE_MS 不合法：${JSON.stringify(rawGrace)}` }
+    }
+    config.pluginGraceMs = pluginGraceMs
+  }
+
   const rawPid = env.DSH_RESTART_WEB_PID
   if (rawPid !== undefined && rawPid.trim() !== '') {
     const webPid = parsePositiveInt(rawPid)
@@ -79,15 +105,34 @@ export interface HelperMainOptions {
   stderr?: (text: string) => void
 }
 
-/** helper 主流程；配置错误只写一行 stderr 并返回 1。 */
+/**
+ * 配置错误时 stderr 大概率是 /dev/null（helper 以 stdio: 'ignore' 派生），
+ * 所以再尽力往 <logDir>/helper-last-error.log 追加一行，方便事后查。
+ */
+function appendHelperErrorLog(env: Record<string, string | undefined>, message: string): void {
+  try {
+    const logDir = env.DSH_RESTART_LOG_DIR?.trim() || join(homedir(), '.dsh', 'dsh-restart')
+    mkdirSync(logDir, { recursive: true })
+    appendFileSync(
+      join(logDir, 'helper-last-error.log'),
+      `${new Date().toISOString()} [pid ${process.pid}] ${message}\n`,
+    )
+  } catch {
+    // 连日志目录都建不出来时只能放弃，不能让 helper 因日志崩溃。
+  }
+}
+
+/** helper 主流程；配置错误写 stderr + helper-last-error.log 并返回 1。 */
 export async function helperMain(options: HelperMainOptions = {}): Promise<0 | 1> {
+  const env = options.env ?? process.env
   const stderr =
     options.stderr ??
     ((text: string) => {
       process.stderr.write(text)
     })
-  const parsed = parseHelperConfig(options.env ?? process.env)
+  const parsed = parseHelperConfig(env)
   if (!parsed.ok) {
+    appendHelperErrorLog(env, `配置错误：${parsed.error}`)
     stderr(`[dsh-restart] helper 配置错误：${parsed.error}\n`)
     return 1
   }

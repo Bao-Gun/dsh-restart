@@ -8,11 +8,16 @@ import {
   RESTART_LOCK_NAME,
   isRefused,
   pickRoute,
-  runRestartHelper,
+  runRestartHelper as runHelperRaw,
   scheduleRestart,
   waitForPort,
 } from '../src/server/restart'
-import type { DaemonRestartHandle, HelperDeps, StartWebOptions } from '../src/server/restart'
+import type {
+  DaemonRestartHandle,
+  HelperDeps,
+  RestartHelperOptions,
+  StartWebOptions,
+} from '../src/server/restart'
 import { helperMain, parseHelperConfig } from '../src/helper/restart'
 
 type Exit = { code: number | null; signal: string | null; error?: string }
@@ -35,6 +40,15 @@ afterAll(async () => {
 
 function profileDir(): string {
   return join(dir, 'profiles', 'web')
+}
+
+/**
+ * 成功判据有两段：/health（web 核心）+ /dsh-restart/api/status（本插件）。
+ * 单测不碰网络，默认把插件探针短路成「已就绪」；专门测插件未加载的用例
+ * 自己传 probePlugin 覆盖。
+ */
+function runRestartHelper(options: RestartHelperOptions, deps: HelperDeps = {}) {
+  return runHelperRaw(options, { probePlugin: async () => true, ...deps })
 }
 
 /** 虚拟时钟：now 返回可控值，sleep 只推进时间，不真等。 */
@@ -139,7 +153,7 @@ describe('waitForPort', () => {
 
 describe('scheduleRestart', () => {
   it('用当前 node 拉起 detached 的 helper，并把配置塞进环境变量', () => {
-    type SpawnOptions = { detached: boolean; stdio: 'ignore'; env: NodeJS.ProcessEnv }
+    type SpawnOptions = { detached: boolean; stdio: 'ignore'; env: NodeJS.ProcessEnv; cwd: string }
     const calls: { command: string; args: string[]; options: SpawnOptions }[] = []
     let unrefs = 0
 
@@ -164,6 +178,7 @@ describe('scheduleRestart', () => {
     expect(calls[0]?.args).toEqual(['/opt/plugin/lib/helper.js'])
     expect(calls[0]?.options.detached).toBe(true)
     expect(calls[0]?.options.stdio).toBe('ignore')
+    expect(calls[0]?.options.cwd).toBe(homedir())
     expect(calls[0]?.options.env).toMatchObject({
       PATH: '/usr/bin',
       DSH_RESTART_PORT: '3080',
@@ -189,6 +204,77 @@ describe('scheduleRestart', () => {
         ),
       ).not.toThrow()
       expect(error).toHaveBeenCalledTimes(1)
+    } finally {
+      error.mockRestore()
+    }
+  })
+
+  it('显式 dshHome / profileName / dshBin 直接进环境变量，不靠路径反推', () => {
+    const calls: { options: { env: NodeJS.ProcessEnv } }[] = []
+
+    scheduleRestart(
+      {
+        port: 3080,
+        profileDir: '/srv/custom/checkout',
+        logDir: '/l',
+        dshHome: '/srv/dsh-home',
+        profileName: 'work',
+        dshBin: '/opt/bin/dsh-canary',
+      },
+      {
+        helperPath: '/h.js',
+        env: { PATH: '/usr/bin' },
+        spawn: (_command, _args, options) => {
+          calls.push({ options })
+          return { unref: () => {} }
+        },
+      },
+    )
+
+    expect(calls[0]?.options.env).toMatchObject({
+      DSH_RESTART_DSH_HOME: '/srv/dsh-home',
+      DSH_RESTART_PROFILE_NAME: 'work',
+      DSH_RESTART_DSH_BIN: '/opt/bin/dsh-canary',
+    })
+  })
+
+  it('helper 文件不存在时不 spawn，只报错', () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      expect(() =>
+        scheduleRestart(
+          { port: 3080, profileDir: '/p', logDir: '/l' },
+          { helperPath: join(dir, 'definitely-missing-helper.js'), env: {} },
+        ),
+      ).not.toThrow()
+      expect(error).toHaveBeenCalledTimes(1)
+      expect(String(error.mock.calls[0]?.[0])).toContain('无法启动重启 helper')
+    } finally {
+      error.mockRestore()
+    }
+  })
+
+  it('helper 子进程的 error 事件会被记下来，而不是静默失败', () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const listeners: ((error: Error) => void)[] = []
+    try {
+      scheduleRestart(
+        { port: 3080, profileDir: '/p', logDir: '/l' },
+        {
+          helperPath: '/h.js',
+          env: {},
+          spawn: () => ({
+            unref: () => {},
+            on: (event, listener) => {
+              expect(event).toBe('error')
+              listeners.push(listener)
+            },
+          }),
+        },
+      )
+      expect(listeners).toHaveLength(1)
+      listeners[0]?.(new Error('spawn ENOENT'))
+      expect(String(error.mock.calls[0]?.[0])).toContain('重启 helper 启动失败')
     } finally {
       error.mockRestore()
     }
@@ -224,6 +310,90 @@ describe('runRestartHelper', () => {
       expect(line).toMatch(/^\d{4}-\d{2}-\d{2}T\S+ \[pid \d+\] /)
     }
     expect((await readdir(dir)).includes(RESTART_LOCK_NAME)).toBe(false)
+  })
+
+  it('daemon 路径 web 回来了但插件没加载：返回 1，并写清是哪一段失败', async () => {
+    const clock = virtualClock()
+    const { probe } = sequenceProbe([true, false, true])
+
+    const code = await runRestartHelper(
+      { port: 3080, profileDir: profileDir(), logDir: dir, waitMs: 60_000, pluginGraceMs: 1_000 },
+      {
+        probe,
+        probePlugin: async () => false,
+        now: clock.now,
+        sleep: clock.sleep,
+        pollMs: 250,
+        startDaemonRestart: daemonExits({ code: 0, signal: null }),
+        startWeb: () => {
+          throw new Error('插件没加载时不该再自拉起')
+        },
+      },
+    )
+
+    expect(code).toBe(1)
+    const lines = await logLines()
+    expect(lines.some((line) => line.includes('插件未加载'))).toBe(true)
+    expect(lines.some((line) => line.includes('/dsh-restart/api/status'))).toBe(true)
+    expect(lines.some((line) => line.includes('web healthy on port'))).toBe(false)
+  })
+
+  it('自拉起后 web 回来但插件没加载：返回 1', async () => {
+    const clock = virtualClock()
+    const { probe } = sequenceProbe([true, false, false, true])
+
+    const code = await runRestartHelper(
+      { port: 3080, profileDir: profileDir(), logDir: dir, waitMs: 60_000, pluginGraceMs: 500 },
+      {
+        probe,
+        probePlugin: async () => false,
+        now: clock.now,
+        sleep: clock.sleep,
+        pollMs: 250,
+        startDaemonRestart: daemonExits({ code: 1, signal: null }),
+        startWeb: () => ({ pid: 4321 }),
+      },
+    )
+
+    expect(code).toBe(1)
+    const lines = await logLines()
+    expect(lines.some((line) => line.includes('自拉起'))).toBe(true)
+    expect(lines.some((line) => line.includes('插件未加载'))).toBe(true)
+  })
+
+  it('自拉起时把显式 dshHome / profileName / dshBin 传下去', async () => {
+    const clock = virtualClock()
+    const { probe } = sequenceProbe([true, false, false, true])
+    const starts: StartWebOptions[] = []
+
+    const code = await runRestartHelper(
+      {
+        port: 3080,
+        profileDir: join(dir, 'elsewhere'),
+        logDir: dir,
+        waitMs: 60_000,
+        dshHome: '/srv/dsh-home',
+        profileName: 'alpha',
+        dshBin: '/opt/bin/dsh-x',
+      },
+      {
+        probe,
+        now: clock.now,
+        sleep: clock.sleep,
+        pollMs: 250,
+        startDaemonRestart: daemonExits({ code: 1, signal: null }),
+        startWeb: (options) => {
+          starts.push(options)
+          return { pid: 4321 }
+        },
+      },
+    )
+
+    expect(code).toBe(0)
+    expect(starts[0]?.profileName).toBe('alpha')
+    expect(starts[0]?.dshBin).toBe('/opt/bin/dsh-x')
+    expect(starts[0]?.env.DSH_HOME).toBe('/srv/dsh-home')
+    expect((await logLines()).some((line) => line.includes('自拉起：dsh --profile alpha --port'))).toBe(true)
   })
 
   it('daemon 明确失败且端口已掉：自拉起并等 /health 回来，返回 0', async () => {
@@ -274,7 +444,9 @@ describe('runRestartHelper', () => {
     )
 
     expect(code).toBe(1)
-    expect(calls()).toBeGreaterThan(300)
+    // 整体预算 60s 用尽后自拉起预算为 0，不再多探 240 次（m4）。
+    expect(calls()).toBeGreaterThan(200)
+    expect(calls()).toBeLessThan(300)
     const lines = await logLines()
     expect(lines.some((line) => line.includes('未在 60000ms 内退出'))).toBe(true)
     expect(lines.some((line) => line.includes('未返回 200'))).toBe(true)
@@ -448,12 +620,40 @@ describe('parseHelperConfig', () => {
     expect(parsed.ok).toBe(true)
     if (parsed.ok) expect(parsed.config.logDir).toBe(join(homedir(), '.dsh', 'dsh-restart'))
   })
+
+  it('读回显式 dshHome / profileName / dshBin 与插件宽限', () => {
+    const parsed = parseHelperConfig({
+      DSH_RESTART_PORT: '3080',
+      DSH_RESTART_PROFILE: '/p',
+      DSH_RESTART_DSH_HOME: '/srv/dsh-home',
+      DSH_RESTART_PROFILE_NAME: 'alpha',
+      DSH_RESTART_DSH_BIN: '/opt/bin/dsh-x',
+      DSH_RESTART_PLUGIN_GRACE_MS: '2500',
+    })
+    expect(parsed.ok).toBe(true)
+    if (parsed.ok) {
+      expect(parsed.config.dshHome).toBe('/srv/dsh-home')
+      expect(parsed.config.profileName).toBe('alpha')
+      expect(parsed.config.dshBin).toBe('/opt/bin/dsh-x')
+      expect(parsed.config.pluginGraceMs).toBe(2500)
+    }
+  })
+
+  it('插件宽限非法时报错', () => {
+    expect(
+      parseHelperConfig({
+        DSH_RESTART_PORT: '3080',
+        DSH_RESTART_PROFILE: '/p',
+        DSH_RESTART_PLUGIN_GRACE_MS: '0',
+      }).ok,
+    ).toBe(false)
+  })
 })
 
 describe('helperMain', () => {
   it('从环境读配置并跑完整流程', async () => {
     const clock = virtualClock()
-    const { probe } = sequenceProbe([true, false, true])
+    const { probe } = sequenceProbe([true, false, false, true])
     const messages: string[] = []
     const logDir = join(dir, 'logs')
 
@@ -469,6 +669,8 @@ describe('helperMain', () => {
       },
       deps: {
         probe,
+        // helperMain 直接调 runRestartHelper，不走文件顶部那个测试包装。
+        probePlugin: async () => true,
         now: clock.now,
         sleep: clock.sleep,
         pollMs: 250,
@@ -495,6 +697,22 @@ describe('helperMain', () => {
       },
     })
     expect(code).toBe(1)
+    expect(messages.join('')).toContain('DSH_RESTART_PORT')
+  })
+
+  it('配置错误也往 helper-last-error.log 落一行（派生时 stderr 是 /dev/null）', async () => {
+    const logDir = join(dir, 'logs')
+    const messages: string[] = []
+    const code = await helperMain({
+      env: { DSH_RESTART_PORT: 'nope', DSH_RESTART_LOG_DIR: logDir },
+      stderr: (text) => {
+        messages.push(text)
+      },
+    })
+    expect(code).toBe(1)
+    const text = await readFile(join(logDir, 'helper-last-error.log'), 'utf8')
+    expect(text).toContain('配置错误')
+    expect(text).toContain('DSH_RESTART_PORT')
     expect(messages.join('')).toContain('DSH_RESTART_PORT')
   })
 })

@@ -9,6 +9,7 @@
  */
 import { spawn as spawnProcess, type ChildProcess } from 'node:child_process'
 import {
+  accessSync,
   closeSync,
   mkdirSync,
   openSync,
@@ -25,13 +26,22 @@ import { fileURLToPath } from 'node:url'
 
 /** dsh web 的 /health 路径；daemon 与冒烟测试也用这个口径（200 才算活）。 */
 const HEALTH_PATH = '/health'
+/**
+ * 本插件的就绪路由（Task 6 提供）。/health 只能证明 web 核心起来了，证明不了
+ * 插件已加载——用错 DSH_HOME 的自拉起进程同样 200 /health，但侧栏里没有按钮。
+ */
+export const PLUGIN_STATUS_PATH = '/dsh-restart/api/status'
+/** 探就绪路由时带的头，便于路由区分「helper 自检」与普通请求。 */
+export const PLUGIN_STATUS_HEADER = 'x-dsh-restart'
+/** web 回来之后给插件就绪的宽限（boot 期间该路由可能短暂 404）。 */
+const PLUGIN_READY_GRACE_MS = 5_000
 /** 轮询间隔。 */
 const POLL_INTERVAL_MS = 250
 /** 单次 /health 探测上限，防止一个卡住的连接把整轮等待拖死。 */
 const PROBE_TIMEOUT_MS = 1_500
 /** daemon 路径默认预算：daemon 自己的 STARTUP_GRACE_MS 低于这个值。 */
 const DEFAULT_WAIT_MS = 60_000
-/** 等锁持有者掉线/端口释放的预算。 */
+/** 等锁持有者掉线/端口释放的预算（也受整体 waitMs 上界约束）。 */
 const TAKEOVER_WAIT_MS = 10_000
 /** 锁文件超过这个年龄一律视为残留（进程可能被 SIGKILL 掉，来不及清理）。 */
 const STALE_LOCK_MS = 10 * 60_000
@@ -55,10 +65,12 @@ export interface DaemonRestartHandle {
 export interface StartWebOptions {
   /** helper 日志的 fd，子进程 stdout/stderr 直接继承。 */
   logFd: number
-  /** 从 profileDir 取出的目录名，如 web。 */
+  /** profile 名，如 web；调用方显式传入时优先于 profileDir 的 basename。 */
   profileName: string
   port: number
   env: NodeJS.ProcessEnv
+  /** dsh 可执行文件；优先于 DSH_RESTART_DSH_BIN 与 PATH 里的 dsh。 */
+  dshBin?: string
 }
 
 export interface WebLaunchResult {
@@ -67,8 +79,12 @@ export interface WebLaunchResult {
 }
 
 export interface HelperDeps {
-  /** 探活；默认 GET http://127.0.0.1:<port>/health。 */
+  /** 探活（只判 web 核心）；默认 GET http://127.0.0.1:<port>/health。 */
   probe?: Probe
+  /** 探本插件是否已加载；默认 GET http://127.0.0.1:<port>/dsh-restart/api/status。 */
+  probePlugin?: Probe
+  /** 插件就绪宽限，默认 5s；集成测试里收窄。 */
+  pluginGraceMs?: number
   /** 启动 dsh-daemon restart。 */
   startDaemonRestart?: (logFd: number) => DaemonRestartHandle
   /** 自拉起 dsh web。 */
@@ -90,22 +106,38 @@ export interface RestartHelperOptions {
   waitMs?: number
   /** 必要时 SIGTERM 掉的旧 web 进程。 */
   webPid?: number
+  /** dsh 的 home（内含 profiles/<name>）；已知就传，缺省才从 profileDir 反推。 */
+  dshHome?: string
+  /** profile 名；已知就传，缺省才从 profileDir 的 basename 反推。 */
+  profileName?: string
+  /** 自拉起用的 dsh 可执行文件；已知就传。 */
+  dshBin?: string
+  /** 等插件状态路由的宽限，默认 5s（在 waitMs 之外）。 */
+  pluginGraceMs?: number
 }
 
 export interface ScheduleRestartOptions {
   port: number
   profileDir: string
   logDir: string
+  /** 显式传 DSH_HOME，避免 helper 从 profileDir 反推错位置。 */
+  dshHome?: string
+  /** 显式传 profile 名，避免 helper 用 basename(profileDir) 猜错。 */
+  profileName?: string
+  /** 自拉起用的 dsh 可执行文件。 */
+  dshBin?: string
 }
 
 export interface SpawnHelperChild {
   unref: () => void
+  /** 真实子进程有；测试替身可以没有。 */
+  on?: (event: 'error', listener: (error: Error) => void) => void
 }
 
 export type SpawnHelper = (
   command: string,
   args: string[],
-  options: { detached: boolean; stdio: 'ignore'; env: NodeJS.ProcessEnv },
+  options: { detached: boolean; stdio: 'ignore'; env: NodeJS.ProcessEnv; cwd: string },
 ) => SpawnHelperChild
 
 export interface ScheduleRestartDeps {
@@ -150,6 +182,29 @@ async function probeHealth(port: number): Promise<boolean> {
     const response = await fetch(`http://127.0.0.1:${port}${HEALTH_PATH}`, {
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
       headers: { accept: 'text/plain' },
+    })
+    try {
+      await response.body?.cancel()
+    } catch {
+      // 丢弃 body 失败不影响判定。
+    }
+    return response.status === 200
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 默认插件就绪探测：GET /dsh-restart/api/status 返回 200 才算插件已加载。
+ *
+ * /health 只覆盖 web 核心；用错 profile/DSH_HOME 的进程同样 200 /health，
+ * 但侧栏里没有按钮——那种情况必须报「插件未加载」，不能报「已重启」。
+ */
+async function probePluginStatus(port: number): Promise<boolean> {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}${PLUGIN_STATUS_PATH}`, {
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+      headers: { accept: 'application/json', [PLUGIN_STATUS_HEADER]: '1' },
     })
     try {
       await response.body?.cancel()
@@ -345,7 +400,7 @@ function defaultStartDaemonRestart(logFd: number): DaemonRestartHandle {
 }
 
 function defaultStartWeb(options: StartWebOptions): WebLaunchResult {
-  const command = process.env.DSH_RESTART_DSH_BIN?.trim() || 'dsh'
+  const command = options.dshBin?.trim() || process.env.DSH_RESTART_DSH_BIN?.trim() || 'dsh'
   try {
     const child = spawnProcess(
       command,
@@ -381,11 +436,14 @@ function defaultKillWeb(pid: number): void {
   }
 }
 
-/** 自拉起 dsh web 时的环境：关掉自动开浏览器，并指向当前 profile 的 DSH_HOME。 */
-function webEnv(profileDir: string): NodeJS.ProcessEnv {
+/**
+ * 自拉起 dsh web 时的环境：关掉自动开浏览器，并指向正确的 DSH_HOME。
+ * dshHome 显式传入时直接用；只有缺省才从 <DSH_HOME>/profiles/<name> 反推。
+ */
+function webEnv(dshHome: string | undefined, profileDir: string): NodeJS.ProcessEnv {
   return {
     ...process.env,
-    DSH_HOME: dirname(dirname(profileDir)),
+    DSH_HOME: dshHome ?? dirname(dirname(profileDir)),
     DSH_DAEMON_OPEN_BROWSER: '0',
   }
 }
@@ -400,6 +458,8 @@ export async function runRestartHelper(
   deps: HelperDeps = {},
 ): Promise<0 | 1> {
   const probe = deps.probe ?? probeHealth
+  const pluginProbe = deps.probePlugin ?? probePluginStatus
+  const pluginGraceMs = deps.pluginGraceMs ?? PLUGIN_READY_GRACE_MS
   const clock: PollClock = {
     now: deps.now ?? Date.now,
     sleep: deps.sleep ?? delay,
@@ -408,7 +468,10 @@ export async function runRestartHelper(
   const startedAt = clock.now()
   const port = options.port
   const profileDir = resolve(options.profileDir)
-  const profileName = basename(profileDir)
+  // profile 名与 DSH_HOME 优先用调用方显式传入的值；只有缺参才从 profileDir 反推
+  // （<DSH_HOME>/profiles/<name>），反推对非标准布局会静默指向错的 profile。
+  const profileName = options.profileName ?? basename(profileDir)
+  const dshHome = options.dshHome === undefined ? undefined : resolve(options.dshHome)
   const waitMs = options.waitMs ?? DEFAULT_WAIT_MS
   const logDir = resolve(
     options.logDir ?? (process.env.DSH_RESTART_LOG_DIR?.trim() || join(homedir(), '.dsh', 'dsh-restart')),
@@ -426,6 +489,22 @@ export async function runRestartHelper(
     })
   const lockPath = join(logDir, RESTART_LOCK_NAME)
   let locked = false
+
+  /**
+   * 成功判据第二段：/health 已经 200 之后，再确认本插件的状态路由也 200。
+   * 两段分开写日志，失败时能看出是「web 没起来」还是「web 起来了但插件没加载」。
+   */
+  const confirmPlugin = async (label: string): Promise<boolean> => {
+    const ready = await pollState(port, pluginGraceMs, true, pluginProbe, clock)
+    if (ready) {
+      write(`✅ web healthy on port ${port} after ${clock.now() - startedAt}ms（${label}，web + 插件均就绪）`)
+      return true
+    }
+    write(
+      `web 已起来但插件未加载（${PLUGIN_STATUS_PATH} 未在 ${pluginGraceMs}ms 内返回 200）；本次重启不算成功`,
+    )
+    return false
+  }
 
   try {
     write(
@@ -459,6 +538,8 @@ export async function runRestartHelper(
     const outcomeNow = (): DaemonOutcome | null => state.outcome
 
     const deadline = clock.now() + waitMs
+    /** 整体预算（m4）：takeover 与自拉起都用剩余额度，总时长 ≈ waitMs + 插件宽限。 */
+    const remaining = (): number => Math.max(0, deadline - clock.now())
     let lastUp = initialUp
     let sawDown = !initialUp
     let healthy = false
@@ -499,8 +580,7 @@ export async function runRestartHelper(
     }
 
     if (healthy) {
-      write(`✅ web healthy on port ${port} after ${clock.now() - startedAt}ms（daemon 路径）`)
-      return 0
+      return (await confirmPlugin('daemon 路径')) ? 0 : 1
     }
 
     const finished = outcomeNow()
@@ -520,7 +600,12 @@ export async function runRestartHelper(
     }
 
     if (nowUp && failure === null) {
-      write('daemon 报成功但 /health 在预算内未探到；不自拉起（避免和 daemon 抢端口）')
+      // m5：把「daemon 卡住」和「daemon 报成功但我们没探到」分开写，别看混。
+      write(
+        finished === null
+          ? `dsh-daemon restart 仍在运行（未在 ${waitMs}ms 内退出），且 /health 一直为 200；不自拉起`
+          : 'daemon 报成功但 /health 在预算内未探到；不自拉起（避免和 daemon 抢端口）',
+      )
       return 1
     }
 
@@ -531,28 +616,36 @@ export async function runRestartHelper(
       }
       write(`接管：SIGTERM 旧 web pid=${options.webPid}`)
       killWeb(options.webPid)
-      const down = await pollState(port, TAKEOVER_WAIT_MS, false, probe, clock)
+      const takeoverBudget = Math.min(TAKEOVER_WAIT_MS, remaining())
+      const down = await pollState(port, takeoverBudget, false, probe, clock)
       if (!down) {
-        write(`SIGTERM 后 ${TAKEOVER_WAIT_MS}ms 内 /health 仍为 200，放弃自拉起`)
+        write(`SIGTERM 后 ${takeoverBudget}ms 内 /health 仍为 200，放弃自拉起`)
         return 1
       }
       write('旧 web 已退出，开始自拉起')
     }
 
     write(`自拉起：dsh --profile ${profileName} --port ${port} --no-open`)
-    const launch = startWeb({ logFd, profileName, port, env: webEnv(profileDir) })
+    const launchOptions: StartWebOptions = {
+      logFd,
+      profileName,
+      port,
+      env: webEnv(dshHome, profileDir),
+    }
+    if (options.dshBin !== undefined) launchOptions.dshBin = options.dshBin
+    const launch = startWeb(launchOptions)
     if (launch.error !== undefined) {
       write(`自拉起失败：${launch.error}`)
       return 1
     }
     write(`自拉起进程已派生${launch.pid === undefined ? '（无 pid）' : ` pid=${launch.pid}`}`)
 
-    const back = await pollState(port, waitMs, true, probe, clock)
+    const selfStartBudget = remaining()
+    const back = await pollState(port, selfStartBudget, true, probe, clock)
     if (back) {
-      write(`✅ web healthy on port ${port} after ${clock.now() - startedAt}ms（自拉起）`)
-      return 0
+      return (await confirmPlugin('自拉起')) ? 0 : 1
     }
-    write(`❌ 自拉起后 ${waitMs}ms 内 /health 未返回 200`)
+    write(`❌ 自拉起后 ${selfStartBudget}ms 内 /health 未返回 200`)
     return 1
   } finally {
     if (locked) {
@@ -569,11 +662,13 @@ export async function runRestartHelper(
 /**
  * 从当前（即将被 daemon 掐掉的）进程里派生 helper。只做一次 detached spawn：
  * helper 与当前进程脱钩，当前进程死了它继续跑；路由已经回过 202，这里出错也不外抛。
+ *
+ * 调用方必须保证响应已经 flush（Task 6：在 res.end() 之后的 'finish' 事件里调用）：
+ * helper 起步就可能 SIGTERM 掉本进程，还没写出去的响应会一起丢。
  */
 export function scheduleRestart(options: ScheduleRestartOptions, deps: ScheduleRestartDeps = {}): void {
   try {
     const helperPath = deps.helperPath ?? fileURLToPath(new URL('./helper.js', import.meta.url))
-    const spawnHelper = deps.spawn ?? spawnProcess
     const env: NodeJS.ProcessEnv = {
       ...(deps.env ?? process.env),
       DSH_RESTART_PORT: String(options.port),
@@ -581,7 +676,26 @@ export function scheduleRestart(options: ScheduleRestartOptions, deps: ScheduleR
       DSH_RESTART_LOG_DIR: resolve(options.logDir),
       DSH_RESTART_WEB_PID: String(process.pid),
     }
-    const child = spawnHelper(process.execPath, [helperPath], { detached: true, stdio: 'ignore', env })
+    // 显式入参优先：helper 不再靠路径反推 profile 位置。
+    if (options.dshHome !== undefined) env.DSH_RESTART_DSH_HOME = resolve(options.dshHome)
+    if (options.profileName !== undefined) env.DSH_RESTART_PROFILE_NAME = options.profileName
+    if (options.dshBin !== undefined) env.DSH_RESTART_DSH_BIN = options.dshBin
+
+    const spawnHelper = deps.spawn
+    if (spawnHelper === undefined) {
+      // 真实路径先验存在：stdio: 'ignore' 下 spawn 的异步 ENOENT 没人看得见。
+      accessSync(helperPath)
+    }
+    const child = (spawnHelper ?? spawnProcess)(process.execPath, [helperPath], {
+      detached: true,
+      stdio: 'ignore',
+      env,
+      // 换个 cwd，避免当前目录被删/不可读时影响 helper 起步。
+      cwd: homedir(),
+    })
+    child.on?.('error', (error) => {
+      console.error(`[dsh-restart] 重启 helper 启动失败：${messageOf(error)}`)
+    })
     child.unref()
   } catch (error) {
     console.error(`[dsh-restart] 无法启动重启 helper：${messageOf(error)}`)
