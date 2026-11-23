@@ -97,6 +97,7 @@
 - [x] **Step 3: 实现纯函数部分**（解析与差分）。冒烟本体同步写：`cp -c -R` 克隆（失败退 `cp -R`）到 `tmpRoot`，`spawn('dsh', ['--profile','web','--port','0','--no-open'])` 带 `DSH_HOME=tmp`，轮询 `http://127.0.0.1:<port>/health` 直到 200 或超时，收 stderr，`finally` 里杀进程树并删目录。
 - [x] **Step 4: 跑测试，确认通过**（单测只覆盖纯函数，真起进程归手工验收）。
 - [x] **Step 5: Commit** `feat: 冒烟与基线差分`
+- [x] **Step 6: 真冒烟一次**：对 `~/.dsh/profiles/web` 实跑，`ok=true`、`failedEntries=[]`、`durationMs=12766ms`；进程组与临时目录已清理。
 
 ### Task 5: 重启 helper
 
