@@ -170,3 +170,4 @@
 - [ ] **Step 3:** `docs/gotchas.md` 第一条：现象「装完插件界面上没反应」→ 原因「客户端是构建产物且 patch 条目要重启才生效」→ 做法「`pnpm build` 后重启一次」。
 - [ ] **Step 4: 跑 `bash check.sh`**，期望全绿。
 - [ ] **Step 5: Commit** `docs: 补齐架构与坑`
+- [x] **Step 6（终审后追加）:** 终审发现宿主单条未激活时输出单数 `1 entry did not activate`，`src/server/smoke.ts` 的 `OPTIONAL_HEADER` 只认复数会把它判绿 → 改成 `/\b(?:entry|entries) did not activate/` 并补单数用例；同批补 README「万一没回来」终端救回步骤与 gotchas 三条（单数 header、watchdog/helper 抢端口、helper 无监督）。

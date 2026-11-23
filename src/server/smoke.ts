@@ -43,7 +43,8 @@ const HEALTH_PROBE_TIMEOUT_MS = 1_500
 const WEB_URL_LINE = /dsh web:\s+(https?:\/\/[^\s]+)/
 
 const ACTIVATION_MARKER = 'did not activate'
-const OPTIONAL_HEADER = /entries did not activate/
+/** 宿主单复数都用：1 entry / N entries。只认复数会漏掉「恰好一个插件未激活」。 */
+const OPTIONAL_HEADER = /\b(?:entry|entries) did not activate/
 /** 可选条目告警：<entry id> (<package>): <detail> */
 const DIAGNOSTIC_LINE = /^(\S+) \(([^()]*)\): /
 /** 必需条目失败块：两空格缩进的 id，下一行才是 Package。 */

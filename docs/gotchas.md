@@ -15,3 +15,6 @@
 - 往 profile 的 `cordis.patch.yml` 加顶层 `- id: restart-button` → 宿主只打印一条告警，不会新增条目，插件永远装不上 → 顶层 `- id:` 只能改已有条目，新增必须用 `- insert:` 块；`scripts/install.mjs` 的 `readPatchSnippet` 会强制校验片段以 `- insert:` 开头（install.mjs:59-66）。
 - 客户端插件产物写成 esm 或忘了包一行自注册 → 宿主不加载、也不报错，按钮永远不出现，单测和构建都绿 → 客户端必须是 classic script 且自带 `window.__ModuleLoader__.load({ id, factory })`；tsup 客户端那份用 iife + banner/footer 把模块体包进 factory，保证首行自注册、副作用延迟到 materialize（tsup.config.ts:26-42）。
 - 插件模块解析不到（没装、软链断、产物缺）→ dsh web 仍能启动，只是 stderr 里一句 `1 entry did not activate`，侧栏少一颗按钮 → 失败模式是「按钮静默消失」，不是「起不来」；所以装完先看这一行，预检失败的文案也要讲明白是插件没加载（见上方 /health 那条）。
+- 宿主只报一条未激活时是单数 `1 entry did not activate`，正则只写 `entries` → 名单永远空，冒烟把「恰好一个插件装坏」判绿 → 单复数都要认（src/server/smoke.ts:46-47）；判绿前必须先看这一行。
+- 登录后 `dsh-daemon` 的 watchdog 每 10s 探活，它和 helper 的自拉起是两套锁（watchdog 看自己的 daemon 状态，helper 用 `restart.lock`）→ helper 杀掉旧 web 后可能与 watchdog 抢同一端口，日志里出现 `EADDRINUSE` 不等于插件坏了 → 确认最后只剩一个实例、/health 200 即可。
+- helper 是 detached 单进程，杀旧 web 后它自己崩了没人拉起；刚启动不到 15 秒时 daemon 还会 `restart skipped` 直接退 0 → 界面全无时只能终端救：`dsh-daemon status` → `dsh-daemon start` → 还不行 `dsh web` 前台看报错；实在不行把 profile 的 `cordis.patch.yml` 里 `restart-button` 那条 insert 块删掉再起（README「万一没回来」一节）。

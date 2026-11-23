@@ -100,6 +100,15 @@ describe('parseNotActivated', () => {
     expect(parseNotActivated(stderr)).toEqual([])
   })
 
+  it('宿主只报一条未激活时用单数 entry，也要抓到', () => {
+    const stderr = [
+      'dsh: warning: 1 entry did not activate',
+      'restart-button (dsh-restart): failed to import: boom',
+    ].join('\n')
+
+    expect(parseNotActivated(stderr)).toEqual(['restart-button'])
+  })
+
   it('有标记时只收紧跟告警头的诊断行，同屏无关括号行不算条目', () => {
     const stderr = [
       'dsh web: warning: 1 entries did not activate',
