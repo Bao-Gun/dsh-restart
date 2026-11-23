@@ -126,7 +126,7 @@
 
 - [ ] **Step 1: 写失败测试**：`isAllowed` 在 `rejection=403` 时 false；无 `x-dsh-restart` 头 false；`GET` 打 `/restart` false；三项齐全 true。
 - [ ] **Step 2: 跑测试，确认失败。**
-- [ ] **Step 3: 实现**：`apply(ctx)` 里用 `ctx.effect(() => ctx.webServer.register({kind:'exact', path, handler}), label)` 注册 `GET /dsh-restart/api/status`（端口取 `ctx.webServer.port`、探 `/health`、读 `last` 并算 `stale`）、`POST /dsh-restart/api/precheck`（NDJSON：每阶段一行 `{"stage":...,"ok":...,"failures":[...]}`，结尾一行 `{"done":true}`，收尾按 `diffFailedEntries(本次未激活名单, last.baseline ?? [])` 判 `ok = health200 && added.length === 0`，通过时 `writeLast({ precheck, baseline: 本次名单 })`，不通过只写 `precheck`、不动基线）、`POST /dsh-restart/api/restart`（先 `202` 落盘，再 `setTimeout(() => scheduleRestart(...), 300)`）。
+- [ ] **Step 3: 实现**：`apply(ctx)` 里用 `ctx.effect(() => ctx.webServer.register({kind:'exact', path, handler}), label)` 注册 `GET /dsh-restart/api/status`（端口取 `ctx.webServer.port`、探 `/health`、读 `last` 并算 `stale`）、`POST /dsh-restart/api/precheck`（NDJSON：每阶段一行 `{"stage":...,"ok":...,"failures":[...]}`，结尾一行 `{"done":true}`，收尾按 `diffFailedEntries(本次未激活名单, last.baseline ?? [])` 判 `ok = health200 && added.length === 0`，通过时 `writeLast({ precheck, baseline: 本次名单, fingerprint: fp })`（fp 来自 `computeFingerprint`；fp 为 null 时不写 precheck，直接判过期），不通过只写 `precheck`、不动基线）、`POST /dsh-restart/api/restart`（先 `202` 落盘，再 `setTimeout(() => scheduleRestart(...), 300)`）。
 - [ ] **Step 4: 跑测试，确认通过。**
 - [ ] **Step 5: Commit** `feat: 宿主路由与请求门`
 
