@@ -3,7 +3,7 @@ __pycache__/
 .venv/
 dist/
 build/
-lib/
+/lib/
 .env
 .env.*
 *.local

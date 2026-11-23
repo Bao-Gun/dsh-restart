@@ -5,7 +5,8 @@
   "type": "module",
   "description": "给 dsh web 加「重启 + 重启前预检」按钮的 DSH 插件",
   "engines": {
-    "node": ">=22"
+    "node": ">=22",
+    "dsh": ">=0.2.2-rc.5"
   },
   "main": "lib/index.js",
   "exports": {
@@ -17,10 +18,13 @@
     "client": {
       "platform": "web",
       "immediately": true
+    },
+    "engines": {
+      "dsh": ">=0.2.2-rc.5"
     }
   },
   "scripts": {
-    "build": "tsup",
+    "build": "rm -rf lib && tsup",
     "test": "vitest run"
   },
   "devDependencies": {

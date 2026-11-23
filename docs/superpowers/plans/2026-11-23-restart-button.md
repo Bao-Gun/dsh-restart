@@ -35,18 +35,19 @@
 **Files:**
 - Create: `package.json`, `tsconfig.json`, `tsup.config.ts`, `vitest.config.ts`, `src/shared/version.ts`
 - Modify: `.gitignore`, `check.sh`（第 ④ 段换成 `pnpm test`）
-- Test: `test/version.test.ts`
+- Test: `test/version.test.ts`, `test/client-artifact.test.ts`
 
 **Interfaces:**
-- Produces: `parseRuntime(version: string): { major: number; minor: number; patch: number; pre: string | null }` —— 后面判兼容要用。
+- Produces: `parseRuntime(version: string): { major: number; minor: number; patch: number; pre: string | null }` —— 后面判兼容要用；非法输入按宿主 `runtimeVersionOf` 同语义抛错，不返回 NaN。
 
-- [ ] **Step 1: 写失败测试** `test/version.test.ts`：`parseRuntime('0.2.2-rc.5')` 等于 `{major:0,minor:2,patch:2,pre:'rc.5'}`；`parseRuntime('1.0.0')` 的 `pre` 是 `null`。
-- [ ] **Step 2: 跑 `pnpm test`，确认失败**（模块不存在）。
-- [ ] **Step 3: 建骨架**：`package.json` 带 `"type":"module"`、`exports { ".": "./lib/index.js", "./client": "./lib/client.js" }`、`dsh.client = { platform: "web", immediately: true }`、脚本 `build: tsup` / `test: vitest run`；`tsup.config.ts` 两个入口 `src/index.ts` 与 `src/client/index.ts`，`format: 'esm'`，`noExternal` 全包；实现 `parseRuntime`。
-- [ ] **Step 4: 跑 `pnpm build`**，确认 `lib/index.js` 与 `lib/client.js` 都生成。
-- [ ] **Step 5:** `.gitignore` 加 `lib/`、`node_modules/`；`check.sh` 第 ④ 段改成 `pnpm test`。
-- [ ] **Step 6: 跑 `bash check.sh`**，期望全绿。
-- [ ] **Step 7: Commit** `feat: 构建链与版本解析`
+- [x] **Step 1: 写失败测试** `test/version.test.ts`：`0.2.2-rc.5` 拆出 `{major:0,minor:2,patch:2,pre:'rc.5'}`；合法正式版 `pre` 为 `null`；补 `v` 前缀与 `+build` 元数据；非法输入（`''`/`0.2`/`abc`/`1.x.0`/`1.0.0-`）抛错。
+- [x] **Step 2: 跑 `pnpm test`，确认失败**（模块不存在；宽松解析对非法输入不抛）。
+- [x] **Step 3: 建骨架**：`package.json` 带 `"type":"module"`、`exports { ".": "./lib/index.js", "./client": "./lib/client.js" }`、`dsh.client = { platform: "web", immediately: true }`、`engines.dsh = ">=0.2.2-rc.5"`（`dsh.engines.dsh` 同值镜像）；脚本 `build: rm -rf lib && tsup` / `test: vitest run`。
+- [x] **Step 3.5: tsup 拆两份配置**：宿主 `format: ['esm']` / `platform: 'node'` / `external: [/^@deepseek-ai\//]`（宿主包不内联）；客户端 `format: ['iife']` / `platform: 'browser'` / banner+footer 包成 `window.__ModuleLoader__.load({ id: "dsh-restart", factory })`，模块体延迟到 materialize 执行。`test/client-artifact.test.ts` 读真实 `lib/client.js` 验证首行注册与 factory 返回值。
+- [x] **Step 4: 跑 `pnpm build`**，确认 `lib/index.js`（ESM）与 `lib/client.js`（iife，首行自注册）都生成。
+- [x] **Step 5:** `.gitignore` 加 `/lib/`、`node_modules/`；`check.sh` 第 ④ 段改成 `pnpm test`。
+- [x] **Step 6: 跑 `bash check.sh`**：第 ④ 段通过；第 ② 段仍红，因为本计划后续任务的文件还没创建（非 Task 1 引入，见 `reports/task-1.md`）。
+- [x] **Step 7: Commit** `feat: 构建链与版本解析`；评审修复轮 `fix: 客户端产物按宿主契约注册 + 严格版本解析`
 
 ### Task 2: 指纹与上次结果
 
