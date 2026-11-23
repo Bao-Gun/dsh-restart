@@ -434,6 +434,17 @@ export function cleanupSequence() {
 }
 
 /** 只同步 profile 的 pnpm-lock.yaml，不碰 node_modules；失败/超时只告警，不算安装失败。 */
+/**
+ * 是否需要同步 lockfile。只在真的写了东西、且这次改动与依赖有关时才同步：
+ * - 本次新增/更新了依赖 → 要同步；
+ * - 依赖已存在但这次补写了 patch（上次半安装后的自愈）→ 也要同步，否则会出现
+ *   package.json 里有 link: 而 pnpm-lock.yaml 里没有 dsh-restart 的不一致态。
+ */
+export function shouldSyncLockfile(applied, plan) {
+  if (!applied.changed) return false
+  return plan.dependency.kind !== 'skip' || plan.patch.changed
+}
+
 export function syncLockfile({ profileDir = DEFAULT_PROFILE_DIR, timeoutMs = 20000, run = runPnpmLockfileOnly } = {}) {
   const started = Date.now()
   const result = run(profileDir, timeoutMs)
@@ -706,7 +717,8 @@ export async function main(argv = process.argv.slice(2), io = { out: console.log
   if (options.apply) {
     const applied = await applyPlan(plan)
     io.out(`已应用: ${applied.changed ? applied.applied.join('；') : '无改动（全部已一致）'}`)
-    if (plan.dependency.kind !== 'skip' && applied.changed) {
+    // 依赖已存在但这次补写了 patch（常见于上次半安装后的自愈）时也要同步，否则 package.json 有 link: 而 lockfile 没有。
+    if (shouldSyncLockfile(applied, plan)) {
       const lock = await syncLockfile({ profileDir: options.profileDir })
       if (lock.ok) {
         io.out(`✓ lockfile: pnpm install --lockfile-only 已同步（${lock.elapsedMs}ms）`)

@@ -16,7 +16,7 @@
 | 菜单行注入 | `src/client/inject.ts` | MutationObserver（防抖 100ms）找 `[role=menu]` 且标签含「设置 / 退出」的账号菜单，把自建行插到最后一行 menuitem 之前（= 倒数第二行）；找不到菜单时退到 `[data-slot="settings.launcher"]` 上方；文案「重启 dsh web」 | `src/client/index.ts` 的 `apply` |
 | 弹窗 | `src/client/dialog.ts`（样式 `src/client/dialog.css.ts`） | 五段 UI（端口 / 健康 / 模拟检查 / 重启 / 上次结果）；三个请求都带 `x-dsh-restart: 1`；precheck 按 NDJSON 逐行画阶段；重启后轮询 status，必须先见 `restarting` 再见 `health===true` 才算回来（90s 超时）；`force` 走 confirm 二次确认；`close()` 里 `token++` + abort 在飞请求 | `src/client/index.ts`（点菜单行时 mount 并 open） |
 | 共享类型 | `src/shared/types.ts`、`src/shared/version.ts` | 服务端与客户端共用的记录形状（`LastRecord` / `PrecheckResult` / `Failure`）；`parseRuntime` 解析宿主版本，非法就抛 | 两端都 import |
-| 安装 | `scripts/install.mjs` | 默认 dry-run 打印计划；`--apply` 写 profile 的 `package.json`（依赖 `link:<repo>`）、追加 `cordis.patch.yml` 的 insert 块、建 `node_modules` 软链、清悬空旧软链；`--verify` 在 `cp -c` 克隆的临时 DSH_HOME 里重做安装并起 `--port 0` 实例，探 /health 200 且 status 200 + `body.ok` 才算 PASS | 人工执行 |
+| 安装 | `scripts/install.mjs` | 默认 dry-run 打印计划；`--apply` 按「依赖 → 清悬空旧软链 → 建 `node_modules` 软链 → 最后写 `cordis.patch.yml`」的顺序落盘（`package.json` 的依赖是 `link:<repo>`，patch 用 insert 块）；中途失败留步骤表并提示重跑自愈，最坏态只会是「链在但配置没认领」（无害），不会出现配置认领不存在的包；写完若本次动了依赖或补了 patch，再跑一次 `pnpm install --lockfile-only --offline` 把 lockfile 补齐（20s 超时，失败只告警）。`--verify` 在 `cp -c` 克隆的临时 DSH_HOME 里重做安装并起 `--port 0` 实例，探 /health 200 且 status 200 + `body.ok` 才算 PASS | 人工执行 |
 
 构建：tsup 三份产物 —— `lib/index.js`（esm/node）、`lib/client.js`（iife/browser，banner 里自注册 `__ModuleLoader__`）、`lib/helper.js`（esm，带 shebang）。`@deepseek-ai/*` 一律 external。
 

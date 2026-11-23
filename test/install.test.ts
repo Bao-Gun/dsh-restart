@@ -375,6 +375,16 @@ describe('--verify 纯逻辑', () => {
     expect(install.VERIFY_DIR_PREFIX).toBe('dsh-restart-verify-')
   })
 
+  it('shouldSyncLockfile：自愈时依赖已 skip 但补写了 patch 也要同步', async () => {
+    const install = await loadInstall()
+    const plan = (dependencyKind: string, patchChanged: boolean) => ({ dependency: { kind: dependencyKind }, patch: { changed: patchChanged } })
+    expect(install.shouldSyncLockfile({ changed: true }, plan('add', false))).toBe(true)
+    expect(install.shouldSyncLockfile({ changed: true }, plan('update', false))).toBe(true)
+    expect(install.shouldSyncLockfile({ changed: true }, plan('skip', true))).toBe(true)
+    expect(install.shouldSyncLockfile({ changed: true }, plan('skip', false))).toBe(false)
+    expect(install.shouldSyncLockfile({ changed: false }, plan('add', true))).toBe(false)
+  })
+
   it('syncLockfile 把目录/超时传给 runner 并记录耗时，失败原样带出 reason', async () => {
     const install = await loadInstall()
     const calls: any[] = []
