@@ -279,6 +279,46 @@ describe('请求门（路由层）', () => {
   })
 })
 
+describe('connection 服务获取（cordis 真机形态）', () => {
+  /**
+   * 真 cordis 的插件 ctx 在未 inject 'connection' 时，属性访问会抛
+   * 'cannot get property "connection" without inject'；但 ctx.get('connection') 仍能取到。
+   * 这里用 getter + get() 复刻这个形态，防止再退回“先 Reflect.get 再 ctx.get”的顺序。
+   */
+  function cordisLikeCtx(service: { requestRejection(req: IncomingMessage): number | undefined } | undefined): RouteContext {
+    const ctx: Record<string, unknown> = {
+      webServer: { port: 3080, register: () => () => {} },
+      effect(callback: () => void | (() => void)) {
+        callback()
+      },
+      get(serviceName: string): unknown {
+        return serviceName === 'connection' ? service : undefined
+      },
+    }
+    Object.defineProperty(ctx, 'connection', {
+      configurable: true,
+      get() {
+        throw new Error('cannot get property "connection" without inject')
+      },
+    })
+    return ctx as unknown as RouteContext
+  }
+
+  it('属性访问抛 inject 错误时，仍能从 ctx.get 拿到 connection 并执行拒绝', async () => {
+    const ctx = cordisLikeCtx({ requestRejection: () => 403 })
+    const { io } = makeIo()
+    const res = await call(createHandlers(ctx, io).status, makeReq({ method: 'GET' }), makeRes())
+    expect(res.statusCode).toBe(403)
+  })
+
+  it('ctx.get 与属性访问都拿不到 connection 时 503', async () => {
+    const ctx = cordisLikeCtx(undefined)
+    const { io } = makeIo()
+    const res = await call(createHandlers(ctx, io).status, makeReq({ method: 'GET' }), makeRes())
+    expect(res.statusCode).toBe(503)
+  })
+})
+
 describe('GET /dsh-restart/api/status', () => {
   it('返回端口、健康、上次结果与过期判定', async () => {
     const fake = makeCtx({ profile: PROFILE, port: 3080 })

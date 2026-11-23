@@ -546,11 +546,18 @@ interface ConnectionLike {
 }
 
 function connectionOf(ctx: RouteContext): ConnectionLike | undefined {
+  // cordis 的插件 ctx 在未声明 inject 'connection' 时，属性访问会直接抛
+  // 'cannot get property "connection" without inject'；ctx.get 才是免 inject 的正规取法。
+  // 先走 get，再把属性访问单独兜底：不能把两者放进同一个 try，否则属性访问一抛就跳过了 get。
+  try {
+    const viaGet = ctx.get('connection')
+    if (isConnection(viaGet)) return viaGet
+  } catch {
+    // get 也不可用时继续试属性访问。
+  }
   try {
     const direct: unknown = Reflect.get(ctx, 'connection')
     if (isConnection(direct)) return direct
-    const viaGet = ctx.get('connection')
-    if (isConnection(viaGet)) return viaGet
   } catch {
     // 服务还没挂上：按拒绝处理。
   }
