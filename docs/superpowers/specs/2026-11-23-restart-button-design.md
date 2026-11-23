@@ -1,6 +1,6 @@
 # 重启按钮（侧栏「更多」倒数第二行）设计
 
-日期：2026-11-23 · 项目：dsh-restart · 状态：实现中（Task 3 已落兼容性快检：宿主判定 + fail-closed；Task 5 已落重启 helper：daemon 优先、自拉起兜底；Task 6 已落三条路由与请求门）
+日期：2026-11-23 · 项目：dsh-restart · 状态：实现中（Task 3 已落兼容性快检：宿主判定 + fail-closed；Task 5 已落重启 helper：daemon 优先、自拉起兜底；Task 6 已落三条路由与请求门；Task 7 已落客户端菜单行与弹窗）
 
 ## 现在是什么情况
 
@@ -21,8 +21,8 @@
 | `src/server/compat.ts` | 快检 A/B：跑 `dsh --profile web --dump-config`；兼容性判定用宿主 `@deepseek-ai/dsh-app-boot` 的 `evaluatePluginCompatibility` / `getDshRuntimeVersion`，不自己写版本比较；该包**既不能静态 import（profile 的 node_modules 里没有官方包）也不能打包**，运行时按入口定位 dsh 安装根、从那里的 `node_modules` 里 `createRequire`；打包会让 `getDshRuntimeVersion()` 读回本插件自己的 version；定位或解析不到、运行时版本非法、清单里 `engines` / `peerDependencies` 形状不合规（宿主会抛错停用插件的那些）时一律判失败（fail-closed），不静默通过 |
 | `src/server/smoke.ts` | 冒烟：APFS 克隆当前 profile → 临时 DSH_HOME，另起 `dsh web --port 0 --no-open`，等 `/health`，收 stderr 里的 `did not activate` 名单，杀进程、删目录（Task 4 已实现；`runSmoke` 的 `ok` 只表示 `/health` 200） |
 | `src/server/restart.ts` | 重启：先回 202，再 fork 一个脱离的 helper；helper 自己先试 `dsh-daemon restart`，端口没回来就自拉起。成功判据是 `/health` 200 **且**本插件 `/dsh-restart/api/status` 200；profile 名 / DSH_HOME / dsh 路径优先用调用方显式传入的值，缺参才从 `profileDir` 反推 |
-| `src/client/inject.ts` | 往「更多」弹层倒数第二行插入 menuitem + MutationObserver 补挂；锚点找不到时退到账号菜单旁 `[data-slot="settings.launcher"]` 上方插同款行 |
-| `src/client/dialog.ts` `src/client/dialog.css.ts` | 弹窗本体与样式，照参考截图 |
+| `src/client/inject.ts` | 往「更多」弹层倒数第二行插入 menuitem + MutationObserver 补挂；锚点找不到时退到账号菜单旁 `[data-slot="settings.launcher"]` 上方插同款行。行样式只抄相邻 menuitem 的 class，不自定义配色；菜单出现后退路行自动移除 |
+| `src/client/dialog.ts` `src/client/dialog.css.ts` | 弹窗本体与样式，照参考截图。样式以字符串导出、只注入一次，全部用 `--dsw-alias-*` token 并带中性色回退；失败原因一律 `textContent`，不当 HTML 解释 |
 | `scripts/install.mjs` | 一次性装进 web profile：写依赖、链过去、往 profile 的 `cordis.patch.yml` 加条目、删悬空软链 |
 | `package.json` | 构建出 `lib/index.js` + `lib/client.js`（客户端必须是构建产物，宿主不编 TS），`dsh.client = { platform: 'web', immediately: true }` |
 

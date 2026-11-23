@@ -139,14 +139,14 @@
 
 **Interfaces:**
 - Consumes: `GET /dsh-restart/api/status`、`POST /dsh-restart/api/precheck`、`POST /dsh-restart/api/restart`（Task 6）。
-- Produces: `injectMenuRow(doc: Document, opts: { onOpen: () => void }): () => void`（返回清理函数）；`mountDialog(doc: Document): { open(): void }`。
+- Produces: `injectMenuRow(doc: Document, opts: { onOpen: () => void; debounceMs?: number }): () => void`（返回清理函数）；`mountDialog(doc: Document, opts?: { fetchImpl?; confirmImpl?; pollIntervalMs?; timeoutMs? }): { open(): void; close(): void }`（options 只为测试注入假 fetch/confirm，生产调用不传）。
 
-- [ ] **Step 1: 写失败测试**（`environment: 'jsdom'`）：给一段含 `role="menu"` 与三个 `role="menuitem"` 的 DOM，`injectMenuRow` 后自建的行位于倒数第二；同一 DOM 再调一次不出现两行；删掉自建行后触发 MutationObserver，行被补回。
-- [ ] **Step 2: 跑测试，确认失败。**
-- [ ] **Step 3: 实现注入**：`MutationObserver(document.body, { childList: true, subtree: true })` + 100ms 防抖；行样式复制相邻 menuitem 的 class；锚点优先 `[role="menu"]`，找不到则退到 `[data-slot="settings.launcher"]` 上方插一条同样式行。
-- [ ] **Step 4: 跑测试，确认通过。**
-- [ ] **Step 5: 实现弹窗**：原生 DOM，按设计稿五段（端口 / 健康 / 模拟检查 / 重启 / 上次结果）；流式读 NDJSON 更新阶段文案；未通过时按钮 `disabled`，下方小字「我知道风险，直接重启」触发 `confirm()`；重启后每 2s 轮询 `status`，90s 超时转红。
-- [ ] **Step 6: Commit** `feat: 菜单入口与重启弹窗`
+- [x] **Step 1: 写失败测试**（`environment: 'jsdom'`，`test/inject.test.ts`，14 例）：给一段含 `role="menu"` 与三个 `role="menuitem"` 的 DOM，`injectMenuRow` 后自建的行位于倒数第二；同一 DOM 再调一次不出现两行；删掉自建行后触发 MutationObserver，行被补回；整棵弹层换掉后补回；退路锚点、点击回调、cleanup、弹窗五段与门禁全部覆盖。
+- [x] **Step 2: 跑测试，确认失败**（RED：`Failed to resolve import "../src/client/inject"`，0 test）。
+- [x] **Step 3: 实现注入**：`MutationObserver(document.body, { childList: true, subtree: true })` + 100ms 防抖；行样式复制相邻 menuitem 的 class；锚点优先 `[role="menu"]`（排除 `data-context-menu`，且标签里要有「设置/退出」这类词），找不到则退到 `[data-slot="settings.launcher"]` 上方插一条同样式行；菜单出现后自动移除退路那条，避免两个入口。
+- [x] **Step 4: 跑测试，确认通过**（`pnpm vitest run test/inject.test.ts` 14 passed）。
+- [x] **Step 5: 实现弹窗**：原生 DOM，按设计稿五段（端口 / 健康 / 模拟检查 / 重启 / 上次结果）；流式读 NDJSON 更新阶段文案（`TextDecoder` 按行缓冲，不整包等）；未通过时按钮 `disabled`，下方小字「我知道风险，直接重启」触发 `confirm()`；重启后每 2s 轮询 `status`，90s 超时转红；样式只注入一次（`ensureDialogStyle`），全部走 `--dsw-alias-*` token 并带中性色回退。
+- [x] **Step 6: Commit** `feat: 菜单入口与重启弹窗`
 
 ### Task 8: 装进 web profile
 
