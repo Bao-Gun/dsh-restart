@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import type { Failure, LastRecord, PrecheckResult, RestartRecord } from '../shared/types'
@@ -99,7 +99,13 @@ export async function computeFingerprint(
     .slice(0, FINGERPRINT_LENGTH)
 }
 
-/** 容错读：文件不存在、空文件、半截 JSON、schema 不符，一律返回空记录。 */
+/**
+ * 容错读：文件不存在、空文件、半截 JSON、schema 不符，一律返回空记录。
+ *
+ * 只保留 `LastRecord` 里的四个字段：未知字段会被忽略，并在下一次 `writeLast` 时丢弃。
+ * 这是有意选择（见报告 m4）——这个文件由本插件独占写，单版本运行；透传未知键会让
+ * 「schema 校验」形同虚设，也让类型契约和磁盘内容不一致。
+ */
 export async function readLast(dir: string): Promise<LastRecord> {
   try {
     const raw = await readFile(join(dir, LAST_FILE), 'utf8')
@@ -110,8 +116,31 @@ export async function readLast(dir: string): Promise<LastRecord> {
   }
 }
 
-/** 合并写：只覆盖 patch 里显式给出的键，其余保留。先写 .tmp 再 rename，避免读到半截文件。 */
-export async function writeLast(dir: string, patch: Partial<LastRecord>): Promise<void> {
+/** 写盘串行链：同一进程内的 read-modify-write 排队，避免两个 patch 各读到旧值、互相抹键。 */
+let writeChain: Promise<void> = Promise.resolve()
+
+function serializeWrite(task: () => Promise<void>): Promise<void> {
+  const run = writeChain.then(task)
+  // 一次写失败不能毒死后面的写：链只看「跑完了」，不看结果
+  writeChain = run.then(
+    () => undefined,
+    () => undefined,
+  )
+  return run
+}
+
+/**
+ * 合并写：只覆盖 patch 里显式给出的键，其余保留。先写同目录 .tmp 再 rename，读者不会看到半截文件；
+ * 进程内的并发写由 `serializeWrite` 排队，不会互相丢键。
+ *
+ * 顶层 `fingerprint` 是 `isStale` 的唯一依据：patch 没显式给就保持原值（带 precheck 时也不会被抹掉），
+ * 显式给了才更新。预检通过时要显式传 `fingerprint`（Task 6 的计划已写明）。
+ */
+export function writeLast(dir: string, patch: Partial<LastRecord>): Promise<void> {
+  return serializeWrite(() => writeLastNow(dir, patch))
+}
+
+async function writeLastNow(dir: string, patch: Partial<LastRecord>): Promise<void> {
   const merged = await readLast(dir)
 
   if (patch.fingerprint !== undefined) merged.fingerprint = patch.fingerprint
@@ -123,8 +152,14 @@ export async function writeLast(dir: string, patch: Partial<LastRecord>): Promis
   const file = join(dir, LAST_FILE)
   // 并发写时各写各的临时文件，rename 是原子的，读方永远看不到半截 JSON
   const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`
-  await writeFile(tmp, `${JSON.stringify(merged, null, 2)}\n`, 'utf8')
-  await rename(tmp, file)
+  try {
+    await writeFile(tmp, `${JSON.stringify(merged, null, 2)}\n`, 'utf8')
+    await rename(tmp, file)
+  } catch (err) {
+    // rename 失败（权限、磁盘满）时别把 .tmp 留在用户目录里
+    await rm(tmp, { force: true }).catch(() => undefined)
+    throw err
+  }
 }
 
 /** 记录里没有指纹、指纹不同、或当前指纹取不到，都算过期。 */

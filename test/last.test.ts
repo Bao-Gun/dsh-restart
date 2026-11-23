@@ -1,20 +1,28 @@
-import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { computeFingerprint, isStale, readLast, writeLast } from '../src/server/last'
-import type { LastRecord } from '../src/shared/types'
+import type { LastRecord, PrecheckResult } from '../src/shared/types'
 
 let dir = ''
+/** 本轮建过的所有临时目录，afterAll 再兜底清一次 */
+const createdDirs: string[] = []
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), 'dsh-restart-last-'))
+  createdDirs.push(dir)
 })
 
 afterEach(async () => {
   await rm(dir, { recursive: true, force: true })
+})
+
+afterAll(async () => {
+  // 双保险：某个用例的 afterEach 被中断/跳过时，也不把 tmpdir 留在机器上
+  await Promise.all(createdDirs.map((created) => rm(created, { recursive: true, force: true })))
 })
 
 async function seedLock(content = 'lockfileVersion: 9\n') {
@@ -82,6 +90,23 @@ describe('readLast', () => {
     await seedLast('{')
 
     expect(await readLast(dir)).toEqual({})
+  })
+
+  it('last.json 是目录时返回空记录，不抛', async () => {
+    await mkdir(join(dir, 'last.json'))
+
+    expect(await readLast(dir)).toEqual({})
+  })
+
+  it.skipIf(process.getuid?.() === 0)('权限拒绝时返回空记录，不抛', async () => {
+    const file = join(dir, 'last.json')
+    await writeFile(file, '{"fingerprint":"0123456789abcdef"}')
+    await chmod(file, 0o000)
+    try {
+      expect(await readLast(dir)).toEqual({})
+    } finally {
+      await chmod(file, 0o600)
+    }
   })
 
   it('schema 不符返回空记录', async () => {
@@ -167,6 +192,53 @@ describe('writeLast', () => {
 
     expect((await readLast(nested)).baseline).toEqual([])
     expect((await readdir(nested)).filter((name) => name.includes('.tmp'))).toEqual([])
+  })
+
+  it('并发写多个 patch 不丢键', async () => {
+    await Promise.all([
+      writeLast(dir, { fingerprint: '0123456789abcdef' }),
+      writeLast(dir, { baseline: ['x'] }),
+      writeLast(dir, { restart: { at: '2026-11-23T12:05:00.000Z', port: 3080 } }),
+    ])
+
+    const record = await readLast(dir)
+    expect(record.fingerprint).toBe('0123456789abcdef')
+    expect(record.baseline).toEqual(['x'])
+    expect(record.restart).toEqual({ at: '2026-11-23T12:05:00.000Z', port: 3080 })
+  })
+
+  it('重写后只保留 schema 字段，未知字段被丢弃', async () => {
+    await seedLast('{"fingerprint":"0123456789abcdef","futureField":true}')
+
+    await writeLast(dir, { baseline: ['x'] })
+
+    const raw: unknown = JSON.parse(await readFile(join(dir, 'last.json'), 'utf8'))
+    expect(raw).toEqual({ fingerprint: '0123456789abcdef', baseline: ['x'] })
+  })
+})
+
+describe('顶层 fingerprint 契约', () => {
+  const at = '2026-11-23T12:00:00.000Z'
+  function precheck(fingerprint: string): PrecheckResult {
+    return { at, ok: true, fingerprint, failures: [], durationMs: 1 }
+  }
+
+  it('显式写 fingerprint 后 readLast→isStale 为 false', async () => {
+    await writeLast(dir, {
+      precheck: precheck('0123456789abcdef'),
+      fingerprint: '0123456789abcdef',
+    })
+
+    expect(isStale(await readLast(dir), '0123456789abcdef')).toBe(false)
+  })
+
+  it('只写 precheck 时保留已有的顶层 fingerprint，不抹掉', async () => {
+    await writeLast(dir, { fingerprint: '0123456789abcdef' })
+    await writeLast(dir, { precheck: precheck('0123456789abcdef') })
+
+    const record = await readLast(dir)
+    expect(record.fingerprint).toBe('0123456789abcdef')
+    expect(isStale(record, '0123456789abcdef')).toBe(false)
   })
 })
 
