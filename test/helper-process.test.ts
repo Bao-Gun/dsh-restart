@@ -134,27 +134,28 @@ describe('helper 真进程', () => {
             DSH_RESTART_PORT: String(port),
             DSH_RESTART_PROFILE: join(dir, 'profiles', 'web'),
             DSH_RESTART_LOG_DIR: logDir,
-            DSH_RESTART_WAIT_MS: '20000',
+            DSH_RESTART_WAIT_MS: '5000',
           },
         })
 
+        // 先读日志再断言退出码：回归时 vitest 的 diff 会直接摊出 helper 日志原文，
+        // 而不是只给一句冷冰冰的 expected 1 to be 0。
+        const names = await readdir(logDir).catch(() => [] as string[])
+        const logName = names.find((name) => name.startsWith('helper-') && name.endsWith('.log'))
+        const log = logName === undefined ? '' : await readFile(join(logDir, logName), 'utf8')
+        expect(log).toContain('dsh-daemon restart 退出 code=1')
+        expect(log).toContain('自拉起：dsh --profile web --port')
+        expect(log).toContain('web healthy on port')
+        expect(log).toContain('fake dsh web listening on')
+        expect(names.includes(RESTART_LOCK_NAME)).toBe(false)
         expect(code).toBe(0)
+
         const pid = Number((await readFile(pidFile, 'utf8')).trim())
         expect(pid).toBeGreaterThan(0)
 
         const response = await fetch(`http://127.0.0.1:${port}/health`)
         expect(response.status).toBe(200)
         await response.body?.cancel()
-
-        const names = await readdir(logDir)
-        const logName = names.find((name) => name.startsWith('helper-') && name.endsWith('.log'))
-        expect(logName).toBeDefined()
-        const log = await readFile(join(logDir, logName as string), 'utf8')
-        expect(log).toContain('dsh-daemon restart 退出 code=1')
-        expect(log).toContain('自拉起：dsh --profile web --port')
-        expect(log).toContain('web healthy on port')
-        expect(log).toContain('fake dsh web listening on')
-        expect(names.includes(RESTART_LOCK_NAME)).toBe(false)
       } finally {
         if (saved.DSH_RESTART_DAEMON_BIN === undefined) delete process.env.DSH_RESTART_DAEMON_BIN
         else process.env.DSH_RESTART_DAEMON_BIN = saved.DSH_RESTART_DAEMON_BIN
