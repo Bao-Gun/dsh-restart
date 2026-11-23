@@ -588,6 +588,8 @@ function buildDialog(doc: Document, handlers: DialogHandlers): DialogView {
   ack.hidden = true
   const ackInput = doc.createElement('input')
   ackInput.type = 'checkbox'
+  ackInput.name = 'dsh-restart-ack'
+  ackInput.autocomplete = 'off'
   ackInput.setAttribute('data-dsh-restart-ack', '1')
   ackInput.addEventListener('change', () => handlers.onAckChange())
   const ackText = doc.createElement('span')
