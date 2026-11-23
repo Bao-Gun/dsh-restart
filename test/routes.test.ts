@@ -534,6 +534,20 @@ describe('POST /dsh-restart/api/precheck', () => {
     expect(ndjson(second).at(-1)).toMatchObject({ done: true, ok: true, saved: true })
   })
 
+  it('注册 close 监听抛错也不会把预检互斥卡死', async () => {
+    const fake = makeCtx({ profile: PROFILE })
+    const handlers = createHandlers(fake.ctx, makeIo().io)
+    const broken = makeRes()
+    broken.once = () => {
+      throw new Error('once boom')
+    }
+    await expect(call(handlers.precheck, makeReq({ method: 'POST' }), broken)).rejects.toThrow('once boom')
+
+    const second = await call(handlers.precheck, makeReq({ method: 'POST' }), makeRes())
+    expect(second.statusCode).toBe(200)
+    expect(ndjson(second).at(-1)).toMatchObject({ done: true, ok: true, saved: true })
+  })
+
   it('已有一轮预检时第二次直接 409，不排队也不重复跑', async () => {
     const fake = makeCtx({ profile: PROFILE })
     let releaseConfig: (value: Failure[]) => void = () => {}

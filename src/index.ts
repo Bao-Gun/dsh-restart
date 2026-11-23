@@ -185,14 +185,16 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
       return
     }
 
-    // 客户端断开就作废这轮结论；进程内没有中断冒烟的可靠办法，只能跑完再丢弃。
-    let cancelled = false
-    const markCancelled = (): void => {
-      if (!res.writableEnded) cancelled = true
-    }
-    res.once('close', markCancelled)
-
     try {
+      // 锁已经拿到；从这里开始任何一步抛错都由 finally 释放。取消监听也放进 try，
+      // 免得 res.once 本身抛错把模块级 running 永久留在 true。
+      // 客户端断开就作废这轮结论；进程内没有中断冒烟的可靠办法，只能跑完再丢弃。
+      let cancelled = false
+      const markCancelled = (): void => {
+        if (!res.writableEnded) cancelled = true
+      }
+      res.once('close', markCancelled)
+
       res.statusCode = 200
       res.setHeader('content-type', 'application/x-ndjson; charset=utf-8')
       res.setHeader('cache-control', 'no-store')
