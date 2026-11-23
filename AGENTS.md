@@ -16,6 +16,8 @@
 | `.superpowers/` | superpowers 的执行工作台：进度、任务简报、评审包（自动忽略，别提交） | 任何要长期留的东西 |
 | `.work/` | 草稿、临时计划（不进 git） | 任何还要留下的东西 |
 | `check.sh` | 唯一的验收脚本 | —— |
+| `site/` | 插件市场索引源：`index.json`（生成物）+ 图标，`.github/workflows/pages.yml` 发布 | 手改的 JSON、随手丢的图片 |
+| `scripts/build-index.mjs` | 从 `package.json` + git HEAD 生成 `site/index.json` | 展示文案以外的逻辑 |
 
 两个 agent 工具在 `src/tools/`：`dsh_restart_precheck` 只预检，`dsh_restart` 会重启并中断当前会话；判定核心与路由共用，见 `docs/architecture.md`。
 
@@ -29,12 +31,14 @@
 | 接着做某个进行中的功能 | `docs/superpowers/plans/` 里对应那份（进度以它为准，别重写） |
 | 想不起当初为什么这么设计 | `docs/superpowers/specs/` 里的设计稿 |
 | 想知道怎么验收 | 本文件「命令」一节 → `check.sh` |
+| 想发一版让插件市场装 | `docs/market.md` |
 
 ## 命令
 
 - 启动：`pnpm install && pnpm build` → `node scripts/install.mjs`（dry-run，只打印将写进 profile 的改动）→ 确认后加 `--apply` → 重启 dsh web（首次手动，之后点按钮）。可选 `node scripts/install.mjs --verify` 先在克隆副本里验证。完整步骤与确认方法见 `README.md`。
 - 检查：`bash check.sh`（唯一判断对错的方式，别靠肉眼；底层是 `pnpm test`）。收尾要贴出退出码和结果行再说完成。
 - 并行开发：工作树放 `.worktrees/`（已在忽略列表）。有 harness 原生 worktree 工具就用它，别手搓 `git worktree`。
+- 发索引：`pnpm build` → 提交代码（含 `lib/*.js`）→ `pnpm market:index` → 再提交 `site/index.json`。顺序反了索引就指向没有产物的提交。
 
 ## 维护
 

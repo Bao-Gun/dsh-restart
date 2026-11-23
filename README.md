@@ -39,6 +39,10 @@ node scripts/install.mjs --apply  # 真写：profile 的 package.json 依赖、c
 
 装完要重启一次 dsh web 让 profile 重新加载。第一次只能手动重启（那时按钮还没加载出来）；之后就可以点按钮了。
 
+## 从索引装
+
+仓库里带了插件市场索引源（`site/index.json`）：在「插件 → 发现 → 添加索引源」贴上 `https://<用户名>.github.io/dsh-restart/index.json`，就能像装别的插件一样一键装，不用 clone。索引怎么生成、发一版要注意什么，见 `docs/market.md`；仓库还是 private 时这条路走不通（Pages 与 git 源安装都有前提），理由也写在那份里。
+
 ## 第一次装完怎么确认生效
 
 左下角头像 → 更多 → **菜单倒数第二行**是「重启」（最后一行是登录 / 退出登录）。

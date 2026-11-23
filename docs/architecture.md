@@ -24,6 +24,8 @@
 
 构建：tsup 三份产物 —— `lib/index.js`（esm/node）、`lib/client.js`（iife/browser，banner 里自注册 `__ModuleLoader__`）、`lib/helper.js`（esm，带 shebang）。`@deepseek-ai/*` 一律 external。
 
+产物 `lib/*.js` 进 git（只放掉 sourcemap）：插件市场按 commit 从 git 装「仓库内容」，装的人机器上没有构建步骤，`main: lib/index.js` 必须已经在仓库里。改完代码忘了 `pnpm build` 就提交，等于把旧产物发出去。索引源在 `site/`，由 `scripts/build-index.mjs` 从 `package.json` + git HEAD 生成，规则与发版顺序见 `docs/market.md`。
+
 ## 数据流
 
 点菜单行 → 弹窗 `GET /dsh-restart/api/status`（端口、/health、上次结果 + 指纹是否过期）→ 点「重启」：没勾「跳过检查」就先 `POST /dsh-restart/api/precheck`（NDJSON 逐行：config → compat → boot → done）→ 克隆 profile 起 `--port 0` 副本冒烟 → 写 `~/.dsh/dsh-restart/last.json` → 判红则停在这里不发重启（勾上「跳过检查」再点可绕过）→ 全过才自动 `POST /dsh-restart/api/restart` 回 202 → `res` 的 finish/close 里派生脱离的 helper → helper 重启并跑两段探针（/health 200、插件 status 200）→ 弹窗轮询 status 看到 `restarting` 消失且 `health: true` → 关掉弹窗并刷新当前页（新宿主加载新插件、侧栏重新出现按钮）。

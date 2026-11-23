@@ -15,6 +15,10 @@
     "./package.json": "./package.json"
   },
   "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "immediately": true
@@ -22,6 +26,7 @@
   },
   "scripts": {
     "build": "rm -rf lib && tsup",
+    "market:index": "node scripts/build-index.mjs",
     "test": "vitest run"
   },
   "devDependencies": {

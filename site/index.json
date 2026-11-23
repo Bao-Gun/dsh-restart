@@ -1,0 +1,64 @@
+{
+  "format": 1,
+  "title": {
+    "en": "Bao-Gun DSH plugins",
+    "zh": "包棍的 DSH 插件"
+  },
+  "description": {
+    "en": "Self-used DSH plugins, installable straight from this index.",
+    "zh": "自己用的一组 DSH 插件，从这个索引直接装。"
+  },
+  "metadata": {
+    "categories": {
+      "interface": {
+        "title": {
+          "en": "Interface",
+          "zh": "界面"
+        }
+      }
+    },
+    "labels": {},
+    "sortKeys": {}
+  },
+  "plugins": [
+    {
+      "name": "dsh-restart",
+      "title": {
+        "en": "Restart & Precheck",
+        "zh": "重启与预检"
+      },
+      "description": {
+        "en": "A restart button for dsh web that reruns startup checks on a cloned profile before it really restarts.",
+        "zh": "在 dsh web 侧栏加一颗「重启」按钮：先克隆 profile 试跑一遍，确认这堆插件还起得来，才真重启。"
+      },
+      "icon": "icons/dsh-restart.svg",
+      "author": "Bao-Gun",
+      "homepage": "https://github.com/Bao-Gun/dsh-restart",
+      "repository": {
+        "url": "https://github.com/Bao-Gun/dsh-restart"
+      },
+      "metadata": {
+        "category": "interface",
+        "keywords": [
+          "restart",
+          "precheck",
+          "reload"
+        ]
+      },
+      "versions": [
+        {
+          "version": "0.1.0",
+          "publishTimestamp": 1795447659,
+          "engines": {
+            "dsh": ">=0.2.2-rc.5"
+          },
+          "source": {
+            "type": "git",
+            "url": "https://github.com/Bao-Gun/dsh-restart.git",
+            "commit": "4e06b66c9193dc18cea133ebb00e5214277f6ba9"
+          }
+        }
+      ]
+    }
+  ]
+}

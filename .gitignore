@@ -3,7 +3,10 @@ __pycache__/
 .venv/
 dist/
 build/
-/lib/
+# 构建产物：lib 下只有 *.js 进 git —— 索引源按 commit 安装，装完就得能跑，
+# 不能在装的人机器上先装 devDependencies 再构建。sourcemap 不进 git。
+/lib/*
+!/lib/*.js
 .env
 .env.*
 *.local
