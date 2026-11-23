@@ -208,6 +208,7 @@ describe('helper 真进程', () => {
 
       const logDir = join(dir, 'logs')
       try {
+        const startedAt = Date.now()
         const code = await helperMain({
           env: {
             DSH_RESTART_PORT: String(port),
@@ -217,12 +218,16 @@ describe('helper 真进程', () => {
             DSH_RESTART_PLUGIN_GRACE_MS: '300',
           },
         })
+        const elapsed = Date.now() - startedAt
 
         const names = await readdir(logDir).catch(() => [] as string[])
         const logName = names.find((name) => name.startsWith('helper-') && name.endsWith('.log'))
         const log = logName === undefined ? '' : await readFile(join(logDir, logName), 'utf8')
         expect(log).toContain('自拉起：dsh --profile web --port')
         expect(log).toContain('插件未加载')
+        // NB1 回归：env 里的 300ms 必须真的生效（旧实现会硬等默认 5s）。
+        expect(log).toContain('未在 300ms 内返回 200')
+        expect(elapsed).toBeLessThan(4_000)
         expect(names.includes(RESTART_LOCK_NAME)).toBe(false)
         expect(code).toBe(1)
       } finally {

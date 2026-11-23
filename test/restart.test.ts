@@ -306,6 +306,8 @@ describe('runRestartHelper', () => {
     expect(lines.some((line) => line.includes('port: down'))).toBe(true)
     expect(lines.some((line) => line.includes('dsh-daemon restart 退出 code=0'))).toBe(true)
     expect(lines.some((line) => line.includes('web healthy on port 3080'))).toBe(true)
+    // 没有显式 dshHome/profileName 时，start 行要标 derived（NB4）。
+    expect(lines.some((line) => line.includes('profile=web source=derived'))).toBe(true)
     for (const line of lines) {
       expect(line).toMatch(/^\d{4}-\d{2}-\d{2}T\S+ \[pid \d+\] /)
     }
@@ -334,7 +336,7 @@ describe('runRestartHelper', () => {
     expect(code).toBe(1)
     const lines = await logLines()
     expect(lines.some((line) => line.includes('插件未加载'))).toBe(true)
-    expect(lines.some((line) => line.includes('/dsh-restart/api/status'))).toBe(true)
+    expect(lines.some((line) => line.includes('/dsh-restart/api/status 未在 1000ms 内返回 200'))).toBe(true)
     expect(lines.some((line) => line.includes('web healthy on port'))).toBe(false)
   })
 
@@ -359,6 +361,7 @@ describe('runRestartHelper', () => {
     const lines = await logLines()
     expect(lines.some((line) => line.includes('自拉起'))).toBe(true)
     expect(lines.some((line) => line.includes('插件未加载'))).toBe(true)
+    expect(lines.some((line) => line.includes('未在 500ms 内返回 200'))).toBe(true)
   })
 
   it('自拉起时把显式 dshHome / profileName / dshBin 传下去', async () => {
@@ -393,7 +396,38 @@ describe('runRestartHelper', () => {
     expect(starts[0]?.profileName).toBe('alpha')
     expect(starts[0]?.dshBin).toBe('/opt/bin/dsh-x')
     expect(starts[0]?.env.DSH_HOME).toBe('/srv/dsh-home')
-    expect((await logLines()).some((line) => line.includes('自拉起：dsh --profile alpha --port'))).toBe(true)
+    const lines = await logLines()
+    expect(lines.some((line) => line.includes('自拉起：dsh --profile alpha --port'))).toBe(true)
+    // NB4：start 行记录解析结果与来源（显式传的，不能只留反推值）。
+    expect(lines.some((line) => line.includes('home=/srv/dsh-home'))).toBe(true)
+    expect(lines.some((line) => line.includes('profile=alpha source=explicit'))).toBe(true)
+  })
+
+  it('第一段 /health 一直没回来时，插件探针一次都不调用（顺序不变式）', async () => {
+    const clock = virtualClock()
+    let pluginCalls = 0
+
+    const code = await runRestartHelper(
+      { port: 3080, profileDir: profileDir(), logDir: dir, waitMs: 2_000 },
+      {
+        probe: async () => false,
+        probePlugin: async () => {
+          pluginCalls += 1
+          return true
+        },
+        now: clock.now,
+        sleep: clock.sleep,
+        pollMs: 250,
+        startDaemonRestart: daemonExits({ code: 1, signal: null }),
+        startWeb: () => ({ pid: 4321 }),
+      },
+    )
+
+    expect(code).toBe(1)
+    expect(pluginCalls).toBe(0)
+    const lines = await logLines()
+    expect(lines.some((line) => line.includes('❌ 自拉起后'))).toBe(true)
+    expect(lines.some((line) => line.includes('未返回 200'))).toBe(true)
   })
 
   it('daemon 明确失败且端口已掉：自拉起并等 /health 回来，返回 0', async () => {

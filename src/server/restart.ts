@@ -166,6 +166,10 @@ export function pickRoute(daemonInstalled: boolean, paused: boolean): 'daemon' |
 /**
  * 重启是否被锁挡住。只做存在性检查：锁是否过期、持有者是否还活着，
  * 由 helper 在 acquireLock 里判断（避免状态接口替 helper 清理锁）。
+ *
+ * 已知窗口：helper 崩溃留下的残留锁要最长 10 分钟（STALE_LOCK_MS）才会被
+ * 下一次 helper 判定为过期，这期间本函数会如实返回 true。状态接口应展示锁的
+ * mtime/pid（或提供强制重启），不要替 helper 删锁。
  */
 export async function isRefused(lockPath: string): Promise<boolean> {
   try {
@@ -246,6 +250,10 @@ async function pollState(
 /**
  * 等端口「活」：/health 200 才算。立即探一次，之后每 250ms 一次。
  * 超时返回 false；最后一次探测可能略超过 timeoutMs。
+ *
+ * 已知窗口：250ms 采样可能漏掉两次探测之间完成的 down→up——保守地当成
+ * 「没看到下掉」，结果是假阴性（把成功当跳过）。需要更可靠时用 pid/startedAt
+ * 比对进程身份，而不是纯端口采样。
  */
 export function waitForPort(port: number, timeoutMs: number, probe: Probe = probeHealth): Promise<boolean> {
   return pollState(port, timeoutMs, true, probe, { now: Date.now, sleep: delay, pollMs: POLL_INTERVAL_MS })
@@ -459,7 +467,8 @@ export async function runRestartHelper(
 ): Promise<0 | 1> {
   const probe = deps.probe ?? probeHealth
   const pluginProbe = deps.probePlugin ?? probePluginStatus
-  const pluginGraceMs = deps.pluginGraceMs ?? PLUGIN_READY_GRACE_MS
+  // 三段取宽限：测试/调用方的 deps 优先，其次 options（helper 从 DSH_RESTART_PLUGIN_GRACE_MS 解析后就走这里），最后默认 5s。
+  const pluginGraceMs = deps.pluginGraceMs ?? options.pluginGraceMs ?? PLUGIN_READY_GRACE_MS
   const clock: PollClock = {
     now: deps.now ?? Date.now,
     sleep: deps.sleep ?? delay,
@@ -506,9 +515,16 @@ export async function runRestartHelper(
     return false
   }
 
+  // NB4：把实际用的 home/profile 及其来源写进 start 行，事后能区分「调用方显式传的」
+  // 与「从 profileDir 反推的」；两者都显式才算 explicit，任一反推就记 derived。
+  const derivedHome = dirname(dirname(profileDir))
+  const effectiveHome = dshHome ?? derivedHome
+  const pathSource =
+    options.dshHome !== undefined && options.profileName !== undefined ? 'explicit' : 'derived'
+
   try {
     write(
-      `restart helper start port=${port} profile=${profileDir} waitMs=${waitMs} log=${log?.file ?? '(stderr)'}`,
+      `restart helper start port=${port} profileDir=${profileDir} home=${effectiveHome} profile=${profileName} source=${pathSource} waitMs=${waitMs} log=${log?.file ?? '(stderr)'}`,
     )
     if (!acquireLock(lockPath, write)) {
       write(`refused: 锁 ${lockPath} 被占用，另一个 helper 正在重启`)
