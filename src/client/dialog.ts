@@ -62,6 +62,13 @@ export interface MountDialogOptions {
   pollIntervalMs?: number
   /** 等 service 回来的超时，默认 90s。 */
   timeoutMs?: number
+  /**
+   * 服务回来之后怎么刷新当前页。默认 window.location.reload()；测试里替换成记账函数。
+   *
+   * 为什么必须刷新：新进程加载的是新插件产物，当前页面还跑着旧 bundle；不刷新等于
+   * 「重启了但用户看不出任何变化」。刷新前先关掉弹窗，页面上不留旧状态。
+   */
+  reload?: () => void
 }
 
 export interface MountedDialog {
@@ -102,6 +109,9 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
   const fetchImpl = options.fetchImpl ?? defaultFetch(doc)
+  const reloadPage = options.reload ?? ((): void => {
+    doc.defaultView?.location.reload()
+  })
 
   let view: DialogView | null = null
   let disposed = false
@@ -391,10 +401,12 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
           if (payload.restarting === true) sawDownOrLocked = true
           const back = payload.restarting !== true && payload.health === true && typeof payload.port === 'number'
           if (sawDownOrLocked && back) {
-            setNotice('已经回来，刷新页面就能用新插件了。', 'ok', target)
+            setNotice('已经回来，正在刷新页面…', 'ok', target)
             target.health.textContent = '正常'
             target.port.textContent = String(payload.port)
-            target.precheck.disabled = false
+            // 先关弹窗再刷新：close() 会停掉轮询、放弃在飞请求，页面重载前不留悬挂状态。
+            close()
+            reloadPage()
             return
           }
         }

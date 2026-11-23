@@ -52,6 +52,8 @@ function psIdentity(pid: number): { lstart: string; command: string } | null {
   try {
     const text = execFileSync('ps', ['-p', String(pid), '-o', 'lstart=', '-o', 'command='], {
       encoding: 'utf8',
+      // 跟生产代码一样钉住 C 语言环境：zh_CN 下 ps 的日期格式不同，正则会对不上。
+      env: { ...process.env, LC_ALL: 'C', LANG: 'C' },
     }).trim()
     const match = /^(\S{3}\s+\S{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$/.exec(text)
     if (match === null) return null

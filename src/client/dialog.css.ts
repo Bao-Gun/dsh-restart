@@ -166,7 +166,9 @@ export const dialogCss = `
   background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, 0.08));
 }
 .dsh-restart-btn--primary {
-  color: #fff;
+  /* 文字色必须跟着填充色走：深色主题下 button-primary-fill 是近白色（rgb(249,250,251)），
+     写死 #fff 就是白字白底，整颗按钮看着一块白（2026-11-23 实测）。 */
+  color: var(--dsw-alias-label-primary-foreground, #fff);
   background: var(--dsw-alias-button-primary-fill, #2b6cff);
   border-color: transparent;
 }

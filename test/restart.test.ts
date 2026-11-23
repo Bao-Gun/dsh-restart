@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vites
 
 import {
   RESTART_LOCK_NAME,
+  daemonRestartEnv,
   isRefused,
   pickRoute,
   runRestartHelper as runHelperRaw,
@@ -748,5 +749,27 @@ describe('helperMain', () => {
     expect(text).toContain('配置错误')
     expect(text).toContain('DSH_RESTART_PORT')
     expect(messages.join('')).toContain('DSH_RESTART_PORT')
+  })
+})
+
+describe('daemonRestartEnv：重启完别自己弹新标签页', () => {
+  it('默认带上 DSH_DAEMON_OPEN_BROWSER=0，并给 watchdog 一个非空 SSH_CONNECTION', () => {
+    const env = daemonRestartEnv({ PATH: '/bin' })
+    expect(env.PATH).toBe('/bin')
+    expect(env.DSH_DAEMON_OPEN_BROWSER).toBe('0')
+    // watchdog.js:793 只做真值判断，空串等于没设。
+    expect(env.SSH_CONNECTION).toBeTruthy()
+  })
+
+  it('真 SSH 会话里已有的 SSH_CONNECTION 不被覆盖', () => {
+    const env = daemonRestartEnv({ SSH_CONNECTION: '10.0.0.1 5000 10.0.0.2 22' })
+    expect(env.SSH_CONNECTION).toBe('10.0.0.1 5000 10.0.0.2 22')
+  })
+
+  it('不改动传进来的对象', () => {
+    const base: NodeJS.ProcessEnv = { PATH: '/bin' }
+    daemonRestartEnv(base)
+    expect(base.DSH_DAEMON_OPEN_BROWSER).toBeUndefined()
+    expect(base.SSH_CONNECTION).toBeUndefined()
   })
 })

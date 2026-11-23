@@ -388,11 +388,29 @@ function acquireLock(lockPath: string, write: (message: string) => void): boolea
   return false
 }
 
+/**
+ * 交给 `dsh-daemon restart` 的 env。
+ *
+ * 重启完自己弹一个新标签页的是 daemon，不是 dsh web：它给 dsh 传了 --no-open
+ * （~/.dsh/daemon/watchdog.js:655），但自己那份 `OPEN_BROWSER` 在本机这版里硬编码成 1
+ * （watchdog.js:227），并不读 DSH_DAEMON_OPEN_BROWSER（:791 的日志文案写了那个变量名，
+ * 实际没接）。外部唯一能影响的分支是 :793 的 SSH_CONNECTION / SSH_TTY —— 所以这里塞一个
+ * 非空值，让它走「远程会话不弹浏览器、自己开」那一支；DSH_DAEMON_OPEN_BROWSER=0 顺手带上，
+ * 等 daemon 真接上这个变量就自动生效。
+ *
+ * 用户要的是「刷新当前页」，不是「再来一个标签页」（2026-11-23 反馈）。
+ */
+export function daemonRestartEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base, DSH_DAEMON_OPEN_BROWSER: '0' }
+  if (!env.SSH_CONNECTION && !env.SSH_TTY) env.SSH_CONNECTION = 'dsh-restart 0 dsh-restart 0'
+  return env
+}
+
 function defaultStartDaemonRestart(logFd: number): DaemonRestartHandle {
   const command = process.env.DSH_RESTART_DAEMON_BIN?.trim() || 'dsh-daemon'
   let child: ChildProcess
   try {
-    child = spawnProcess(command, ['restart'], { stdio: ['ignore', logFd, logFd], env: process.env })
+    child = spawnProcess(command, ['restart'], { stdio: ['ignore', logFd, logFd], env: daemonRestartEnv() })
   } catch (error) {
     return { exited: Promise.resolve({ code: null, signal: null, error: messageOf(error) }) }
   }

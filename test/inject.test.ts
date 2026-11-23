@@ -680,7 +680,13 @@ describe('mountDialog：五段与状态', () => {
       ].join('\n') + '\n'),
       '/dsh-restart/api/restart': jsonResponse({ ok: true, at: '2026-11-23T04:00:01.000Z', port: 3080 }, 202),
     })
-    const dialog = mountDialog(document, { fetchImpl, pollIntervalMs: 40, timeoutMs: 2000 })
+    const dialog = mountDialog(document, {
+      fetchImpl,
+      pollIntervalMs: 40,
+      timeoutMs: 2000,
+      // jsdom 没有真实导航：默认 reload 会打 "Not implemented" 噪声，这条用例不关心它。
+      reload: () => {},
+    })
     dialog.open()
     await waitFor(() => precheckButton().disabled === false)
     precheckButton().click()
@@ -691,8 +697,46 @@ describe('mountDialog：五段与状态', () => {
     // 这一包是旧进程（restarting:true），不许显示「已经回来」。
     expect(noticeText()).not.toContain('已经回来')
 
-    await waitFor(() => noticeText().includes('已经回来'))
-    expect(textOf('[data-dsh-restart-port]')).toContain('3080')
+    // 真回来之后弹窗会关掉（见下一条用例），所以这里以「旧包没被当成回来」为准。
+    expect(noticeText()).not.toContain('已经回来')
+    await waitFor(() => dialogRoot() === null)
+  })
+
+  it('服务回来后关掉弹窗、刷新当前页，不叫用户自己刷（2026-11-23 反馈）', async () => {
+    let statusCalls = 0
+    let reloads = 0
+    const { fetchImpl } = fakeFetch({
+      '/dsh-restart/api/status': () => {
+        statusCalls += 1
+        if (statusCalls === 1) return jsonResponse(statusPayload({ last: {} }))
+        if (statusCalls === 2) return jsonResponse(statusPayload({ restarting: true, last: {} }))
+        return jsonResponse(statusPayload({ restarting: false, port: 3080, last: {} }))
+      },
+      '/dsh-restart/api/precheck': ndjsonResponse([
+        JSON.stringify({ stage: 'config', ok: true, failures: [] }),
+        JSON.stringify({ stage: 'compat', ok: true, failures: [] }),
+        JSON.stringify({ stage: 'boot', ok: true, failures: [], entries: [], added: [], health: true }),
+        JSON.stringify({ done: true }),
+      ].join('\n') + '\n'),
+      '/dsh-restart/api/restart': jsonResponse({ ok: true, at: '2026-11-23T04:00:01.000Z', port: 3080 }, 202),
+    })
+    const dialog = mountDialog(document, {
+      fetchImpl,
+      pollIntervalMs: 40,
+      timeoutMs: 2000,
+      reload: () => {
+        reloads += 1
+      },
+    })
+    dialog.open()
+    await waitFor(() => precheckButton().disabled === false)
+    precheckButton().click()
+    await waitFor(() => restartButton().disabled === false)
+    restartButton().click()
+
+    await waitFor(() => reloads === 1)
+    // 刷新前先把弹窗收掉，页面上不留旧状态。
+    expect(dialogRoot()).toBeNull()
   })
 
   it('NDJSON 每条 stage 到达就渲染，不等整包（M3）', async () => {

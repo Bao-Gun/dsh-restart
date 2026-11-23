@@ -24,3 +24,8 @@
 - 预检判红用 `window.confirm` 做二次确认 → 宿主里是个阻塞弹框，与弹窗自己的视觉完全不搭，每次都要多点一次 → 改成弹窗内的「我知道风险」勾选框：勾上直接点亮重启按钮，勾选框只在「本轮跑完且判红」时显示（`src/client/dialog.ts` 的 `refreshGate`）。
 - 在 cordis 插件里直接读 `ctx.tools` 属性（未 `inject 'tools'`）→ 抛 `cannot get property "tools" without inject`；单测里的假 ctx 是普通对象，照不出这条规则，容易全绿上线才炸 → 必须 `ctx.get('tools')` 并自己判形状，取不到就当宿主没装工具服务（`src/tools/index.ts` 的 `toolsOf`）；`profileContext` 同理走 `ctx.get`（`src/server/profile.ts`）。
 - `dsh_restart` 里先 `concludeTurn()` 再 `issueRestartLater(...)` 排延迟派生 → 本轮可能立刻收尾，helper 还没排上，重启就丢了；反过来先派生再结束本轮，工具结果也来得及落盘 → 顺序必须是先 `issueRestartLater`、后 `concludeTurn`（`src/tools/restart.ts`）；2.5 秒延迟就是给落盘留的时间，helper 一启动就可能掐掉本进程。
+
+- 主按钮文字写死 `#fff` → 暗色皮肤下 `--dsw-alias-button-primary-fill` 是接近白的 `rgb(249,250,251)`，白字白底，按钮上的「重启」看不见 → 主题把「深底白字」和「白底深字」两套都换成了 CSS 变量，文字必须用 `var(--dsw-alias-label-primary-foreground)`，别写死颜色（`src/client/dialog.css.ts`）。
+- 以为 `DSH_DAEMON_OPEN_BROWSER=0` 能让 daemon 别开浏览器 → `~/.dsh/daemon/watchdog.js:227` 是 `const OPEN_BROWSER = 1;`，这个环境变量压根没接，唯一的闸口是 `watchdog.js:793` 的 `else if (process.env.SSH_CONNECTION || process.env.SSH_TTY)`，而那是个生成文件、`dsh_daemon_reinstall` 会覆盖 → 在 helper 里派生 daemon 时自己塞 `DSH_DAEMON_OPEN_BROWSER=0` 和一条假 `SSH_CONNECTION`（`src/server/restart.ts` 的 `daemonRestartEnv`），页面交给弹窗自己刷新。
+- 用 `ps -o lstart=` 取进程启动时间做身份比对 → 中文 locale（`LANG=zh_CN.UTF-8`）下 macOS 打成 `一 11/23 22:40:14 2026`，与英文月份正则对不上，所有 pid 身份都变成「无法确认」，陈旧试跑的清扫因此不再发信号，孤儿实例带着端口一直活着 → 调 `ps` 时钉住 `LC_ALL=C`、`LANG=C`（`src/server/smoke.ts` 的 `probeProcessIdentity`）。
+

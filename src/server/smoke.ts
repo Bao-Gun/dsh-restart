@@ -180,7 +180,15 @@ async function probeProcessIdentity(pid: number): Promise<ProcessIdentity | null
     const { stdout } = await execFileAsync(
       'ps',
       ['-p', String(pid), '-o', 'lstart=', '-o', 'command='],
-      { timeout: 2_000, maxBuffer: 64 * 1024, encoding: 'utf8' },
+      {
+        timeout: 2_000,
+        maxBuffer: 64 * 1024,
+        encoding: 'utf8',
+        // 必须钉住 C 语言环境：zh_CN 下 macOS 的 ps 会把日期打成「一 11/23 22:40:14 2026」，
+        // 与下面这条正则对不上，于是所有身份比对都退化成「无法确认」——清扫不再发信号，
+        // 孤儿实例就这样活下来（2026-11-23 本机 LANG=zh_CN.UTF-8 实测）。
+        env: { ...process.env, LC_ALL: 'C', LANG: 'C' },
+      },
     )
     const line = stdout.trim()
     const match = /^(\S{3}\s+\S{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$/.exec(line)

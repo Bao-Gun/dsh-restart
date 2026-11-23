@@ -10,7 +10,7 @@
 - 弹窗分五段：服务（端口、健康）、模拟检查、重启、上次结果；标题就是「重启」。
 - 「开始检查」跑三段：dump-config、插件版本快检、克隆副本冒烟；服务端用 NDJSON 逐行推阶段，弹窗逐条画出来。
 - 只有两件事会拦住重启：配置合不出来、试启动起不来。插件版本不符、缺包、试跑里没激活，都只画成黄字提示（宿主本来也只是跳过那个插件，web 照样能起）。
-- 「重启」：服务端先回 202，再派生一个脱离的 helper 去重启（先试 dsh-daemon restart，端口没回来就自己 dsh --profile <name> --port <port> --no-open 拉起）。回来后两段探针都要过：/health 200 且插件自己的 /dsh-restart/api/status 200，否则报「web 已起来但插件未加载」。
+- 「重启」：服务端先回 202，再派生一个脱离的 helper 去重启（先试 dsh-daemon restart，端口没回来就自己 dsh --profile <name> --port <port> --no-open 拉起）。回来后两段探针都要过：/health 200 且插件自己的 /dsh-restart/api/status 200，否则报「web 已起来但插件未加载」。都没问题就自己关掉弹窗、刷新当前页（不新开标签页，也不用你手刷）。
 - 预检不往真实 profile 写任何东西：只在 APFS 克隆出来的临时 DSH_HOME 里试跑。结果写 ~/.dsh/dsh-restart/last.json，带 profile 指纹（lockfile + dsh 版本），装完插件会显示「已过期」。
 
 ## 给 agent 的两个工具
@@ -20,7 +20,7 @@
 | 工具 | 参数 | 做什么 | 返回 |
 |---|---|---|---|
 | `dsh_restart_precheck` | 无 | 跑与弹窗同一套三段预检（配置合成 → 插件兼容 → 克隆 profile 试启动），共用同一把进程锁；已有预检在跑时不排队，直接返回 `busy` | `ok` / `busy` / `cancelled` / `saved` / `durationMs` / `health` / `failures[]` / `warnings[]` / `entries[]` / `fingerprint` / `summary`，11 个字段全有值 |
-| `dsh_restart` | `force?: boolean` | 先走重启守卫（profile / 端口 / restart.lock），再决定要不要预检；通过后延迟约 2.5 秒派生 helper，并结束当前回合。**调用它会中断本会话**，重启完成后要硬刷页面 | `ok` / `restarted` / `reason` / `port` / `profileName` / `failures[]` / `warnings[]` / `summary`，8 个字段全有值 |
+| `dsh_restart` | `force?: boolean` | 先走重启守卫（profile / 端口 / restart.lock），再决定要不要预检；通过后延迟约 2.5 秒派生 helper，并结束当前回合。**调用它会中断本会话**；浏览器页面在重启完成后由弹窗自己刷新（agent 调用时那一侧的页面刷新不了，需要用户自己刷） | `ok` / `restarted` / `reason` / `port` / `profileName` / `failures[]` / `warnings[]` / `summary`，8 个字段全有值 |
 
 - 什么时候跳过预检：`force: true` 直接跳过；否则若 `last.json` 里上一次预检还新鲜（profile 指纹没变）且通过，也跳过重跑；上一次判红或指纹过期才现场跑。
 - 判红怎么办：`dsh_restart` 返回 `reason: "precheck-failed"` 和失败清单，不重启。确认风险后由调用方显式传 `force: true` 再调一次；工具不会自己 force。
