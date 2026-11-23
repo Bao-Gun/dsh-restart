@@ -1,0 +1,66 @@
+# 重启按钮（侧栏「更多」倒数第二行）设计
+
+日期：2026-11-23 · 项目：dsh-restart · 状态：待确认（已过 builder check）
+
+## 现在是什么情况
+
+`dsh web` 在 3080 上由 `dsh-daemon 0.1.33` 管着（PID 77792），watchdog 未启动。装插件、改配置之后要让它生效，只能手停手起，一周三次、每次约五分钟；更麻烦的是插件装坏了这件事，往往要重启完才发现。
+
+## 目标
+
+侧栏左下角「更多」菜单里，倒数第二行加一颗「重启 dsh web」。点它弹一个框：先跑一次模拟启动检查，确认当前插件组合起得来，再一键重启。装坏的插件在重启之前就被拦下。
+
+不做：dsh 自身升级、插件市场、任何更新检查。
+
+## 每块怎么动
+
+| 文件 | 干什么 |
+|---|---|
+| `src/index.ts` | 插件入口。向 `ctx.webServer.register({kind:'prefix', path:'/dsh-restart/'})` 挂路由；组装下面几个模块 |
+| `src/server/status.ts` | 当前端口、探 `/health`、读写 `~/.dsh/dsh-restart/last.json`、算 profile 指纹 |
+| `src/server/quickcheck.ts` | 快检 A/B：跑 `dsh --profile web --dump-config`；兼容性直接 import `@deepseek-ai/dsh-app-boot` 的 `evaluatePluginCompatibility` / `getDshRuntimeVersion`，不自己写版本比较 |
+| `src/server/smoke.ts` | 冒烟：APFS 克隆当前 profile → 临时 DSH_HOME，另起 `dsh web --port 0 --no-open`，等 `/health`，收 stderr 里的 `did not activate` 名单，杀进程、删目录 |
+| `src/server/restart.ts` | 重启：先回 202，再 fork 一个脱离的 helper；helper 自己先试 `dsh-daemon restart`，端口没回来就自拉起 |
+| `src/client/inject.ts` | 往「更多」弹层倒数第二行插入 menuitem + MutationObserver 补挂；锚点找不到时退到 `sidebar.footer.action` 插槽 |
+| `src/client/index.tsx` `dialog.module.css` | 弹窗本体与样式，照参考截图 |
+| `scripts/install.mjs` | 一次性装进 web profile：写依赖、链过去、往 profile 的 `cordis.patch.yml` 加条目、删悬空软链 |
+| `package.json` | 构建出 `lib/index.js` + `lib/client.js`（客户端必须是构建产物，宿主不编 TS），`dsh.client = { platform: 'web', immediately: true }` |
+
+## 数据流
+
+1. 外壳渲染账号菜单 → MutationObserver 看到弹层出现 → 在最后一项（退出登录 / 登录）之前插一颗 menuitem。
+2. 点击 → 弹窗 `GET /dsh-restart/api/status`：端口、健康、上次结果（带指纹判定是否过期），一次填满。
+3. 点「开始模拟检查」→ `POST /dsh-restart/api/precheck` → 快检 A → 快检 B → 冒烟 C，阶段通过 SSE 推给弹窗，结果写 `last.json`。
+4. 点「重启 dsh web」→ `POST /dsh-restart/api/restart` 先回 202，300ms 后 fork 脱离 helper（响应必须在进程死之前落到 socket）。
+5. 弹窗轮询 `/health` 与 `/dsh-restart/api/status`，两个都 200 才显示「已回来」，90 秒超时报红。
+
+## 通过 / 不通过怎么算
+
+- 快检 A：`dump-config` 退出码 0 且 stderr 无 `did not activate`。
+- 快检 B：每个插件按宿主的规则判兼容（engines.dsh，缺省看 dsh peer 依赖，非法范围算不满足），报出插件名与期望值。
+- 冒烟 C：`/health` 200 **且** 本次启动的未激活名单里没有**基线之外的新增项**。基线 = 上一次通过时记下的名单；外部资源插件（18787、tailcat、cloudflared 这些）在试跑里稳定失败，第二次起自然落进基线，不会反复报红。弹窗里始终列出完整名单，不是只说一句「未通过」。
+- 三段的失败都带具体条目标签（哪个插件、哪条约束、期望 vs 实际）。
+
+## 关键约束
+
+- **先回话再重启。** 重启会掐掉当前请求所在进程，响应先落 socket。
+- **冒烟用 APFS 克隆，不用硬链接。** `cp -c`（clonefile）写时复制，快到忽略不计，且试跑的写入不会落到正在跑的 profile 上——硬链接会共享 inode，试跑写日志、写 auth 文件、写会话都会写进线上状态。
+- **端口冲突不算红。** 试跑环境与线上必然抢 18787、18887 这类固定端口，冲突进基线，不阻断。
+- **不回写运行中的 profile。** 预检全程不碰 `~/.dsh/profiles/web`。
+- **重启的执行者是 helper，不是本进程。** daemon 被暂停或没装时会先 SIGTERM 再等端口，本进程会在半路死掉、拿不到结果；所以 fork 一个脱离的 helper，它先试 daemon，端口没回来就自己 `--no-open` 拉起，顺带压掉 daemon 默认开新标签页的行为。
+- **两个 POST 不收无来历的请求**：校验 `Origin`/`Host` 与自身一致，且要求自定义头 `X-DSH-Restart`（跨站发不出来）。本机单用户也照做——将来开到 LAN 或隧道后面，这就是远程关机按钮。
+- **上次结果会过期。** `last.json` 带 profile 指纹（lockfile 摘要 + dsh 版本）；对不上就显「已过期，需重新检查」，按钮回到灰禁。装完插件看到的是上一次的「通过」，正是最危险的那一刻。
+- **判定回来不能只看 `/health`**：插件自己的 status 也要 200。
+
+## 范围
+
+做：菜单入口、弹窗、三段预检、重启（daemon 优先 / helper 兜底）、上次结果、日志落盘、装进 web profile 并清掉悬空的 `dsh-restart-update` 软链。
+
+不做：多端口、多 profile、远程机器、升级、插件启停、无头浏览器验客户端加载。
+
+## 怎么验收
+
+- `bash check.sh` 全绿（含 `pnpm test`）。
+- 单测覆盖：兼容性判定包装、基线差分、指纹失效判定——纯函数，不碰进程。
+- 手工三步：菜单里能看到那一行且是倒数第二 → 点开弹窗显示端口 3080 与健康状态 → 塞一个 `engines.dsh` 写错的插件，预检必须点它的名，按钮灰禁。
+- 真重启一次：页面自己回到可用状态，`last.json` 记下这次结果。
