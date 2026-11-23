@@ -13,12 +13,12 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 
-import type { Failure, LastRecord, PrecheckResult } from './shared/types'
+import type { LastRecord } from './shared/types'
 import { computeFingerprint, isStale, readLast, writeLast } from './server/last'
 import { compatFailures, hostRuntimeVersion, readInstalled } from './server/compat'
-import type { InstalledPlugin } from './server/compat'
-import { diffFailedEntries, runDumpConfig, runSmoke } from './server/smoke'
-import type { SmokeResult } from './server/smoke'
+import { runDumpConfig, runSmoke } from './server/smoke'
+import { acquirePrecheck, releasePrecheck, runPrecheckRun } from './server/precheck'
+import type { PrecheckIo, PrecheckOutcome } from './server/precheck'
 import {
   PLUGIN_STATUS_PATH,
   RESTART_LOCK_NAME,
@@ -60,22 +60,11 @@ export interface RouteContext {
   get(service: string): unknown
 }
 
-/** 路由用到的全部 IO / 时钟。测试注入假实现，生产走 defaultIo()。 */
-export interface RouteIo {
-  now(): Date
-  readLast(dir: string): Promise<LastRecord>
-  writeLast(dir: string, patch: Partial<LastRecord>): Promise<void>
-  computeFingerprint(profileDir: string, dshVersion: string | null): Promise<string | null>
-  runtimeVersion(): string | null
+/** 路由用到的全部 IO / 时钟；预检那部分与核心模块共用同一份契约。 */
+export interface RouteIo extends PrecheckIo {
   probeHealth(port: number): Promise<boolean>
-  runDumpConfig(profileDir: string): Promise<Failure[]>
-  readInstalled(profileDir: string, onWarning?: (failure: Failure) => void): Promise<InstalledPlugin[]>
-  compatFailures(plugins: InstalledPlugin[], runtimeVersion: string): Failure[]
-  runSmoke(options: { profileDir: string; tmpRoot: string }): Promise<SmokeResult>
   scheduleRestart(options: ScheduleRestartOptions): void
   isRefused(lockPath: string): Promise<boolean>
-  tmpRoot: string
-  logDir: string
 }
 
 export interface Handlers {
@@ -146,8 +135,7 @@ export function apply(ctx: RouteContext): void {
 
 export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = {}): Handlers {
   const io = withOverrides(defaultIo(), overrides)
-  // 进程内互斥：预检最贵的一段是克隆 profile 起实例，两个并行会互抢固定端口。
-  let precheckRunning = false
+  // 预检的进程内互斥已搬进 core（acquirePrecheck / releasePrecheck），路由与工具共用那一把锁。
   // 进程内重启互斥：挡住同一进程内同时点两次；跨进程仍以 helper 的 lock 文件为准。
   let restartStarting = false
 
@@ -191,7 +179,7 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
       respondJson(res, 503, { ok: false, error: '取不到 profileContext，无法预检' })
       return
     }
-    if (precheckRunning) {
+    if (!acquirePrecheck()) {
       // 不排队：排队只会让用户等两轮克隆，第二轮还大概率看到同一份过期结论。
       respondJson(res, 409, { ok: false, error: '已有一轮预检在进行，等它结束再试' })
       return
@@ -204,187 +192,76 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
     }
     res.once('close', markCancelled)
 
-    res.statusCode = 200
-    res.setHeader('content-type', 'application/x-ndjson; charset=utf-8')
-    res.setHeader('cache-control', 'no-store')
-    // 反向代理（如果将来有）默认会攒缓冲；显式关掉，保证阶段行真的逐行出去。
-    res.setHeader('x-accel-buffering', 'no')
     try {
-      res.flushHeaders()
-    } catch {
-      // 头已经发出去不算错。
-    }
-
-    const startedAt = Date.now()
-    const write = (payload: unknown): void => {
-      // writableEnded 之外还要看 destroyed：客户端断开后底层 socket 已不在，
-      // 但 Node 允许 write() 不抛错，这里必须主动停，避免每阶段空写。
-      if (res.writableEnded) return
-      if ((res as { destroyed?: boolean }).destroyed === true) return
+      res.statusCode = 200
+      res.setHeader('content-type', 'application/x-ndjson; charset=utf-8')
+      res.setHeader('cache-control', 'no-store')
+      // 反向代理（如果将来有）默认会攒缓冲；显式关掉，保证阶段行真的逐行出去。
+      res.setHeader('x-accel-buffering', 'no')
       try {
-        res.write(JSON.stringify(payload) + '\n')
-      } catch (error) {
-        console.error('[dsh-restart] NDJSON 写失败：' + messageOf(error))
-      }
-    }
-
-    // 取消时补一条 boot 行 + done 行：客户端至少知道这轮没结论，而不是连接莫名其妙断掉。
-    const cancelledPayload = (smokeResult?: SmokeResult): void => {
-      write({
-        stage: 'boot',
-        ok: false,
-        cancelled: true,
-        failures: smokeResult?.failures ?? [],
-        warnings: [],
-        entries: smokeResult?.failedEntries ?? [],
-        added: [],
-        health: smokeResult?.health ?? false,
-      })
-      write({ done: true, ok: false, saved: false, cancelled: true, reason: 'cancelled' })
-      try {
-        res.end()
+        res.flushHeaders()
       } catch {
-        // 客户端已经走了。
-      }
-    }
-
-    try {
-      // 置位放进 try：后面任何一步（包括同步的头部设置）抛错，finally 都会释放。
-      precheckRunning = true
-
-      // 快检 A：配置合成本身会不会挂。
-      const configFailures = await stage('config', () => io.runDumpConfig(profile.dir))
-      write({ stage: 'config', ok: configFailures.length === 0, failures: configFailures })
-
-      // 快检 B：装着的插件跟当前 dsh 版本兼不兼容。
-      //
-      // 这一段的结论**不拦重启**：宿主遇到版本不符、清单读不动的插件只会跳过它，
-      // dsh web 照样起得来（实机上 dsh-mcp-connector 缺包也一直是这个状态）。
-      // 拦下来只会让预检永远过不去，让人没法重启；所以全部降级成「提示」，
-      // 真起不来的情况交给下面的试启动去抓。
-      const version = io.runtimeVersion()
-      const pluginWarnings: Failure[] = []
-      try {
-        const plugins = await io.readInstalled(profile.dir, (failure) => pluginWarnings.push(failure))
-        pluginWarnings.push(...io.compatFailures(plugins, version ?? ''))
-      } catch (error) {
-        pluginWarnings.push({ kind: 'compat', message: '兼容性检查没跑完：' + messageOf(error) })
-      }
-      write({ stage: 'compat', ok: true, failures: [], warnings: pluginWarnings })
-
-      if (cancelled) {
-        cancelledPayload()
-        return
+        // 头已经发出去不算错。
       }
 
-      // 快检 C：克隆 profile 真起一个实例，收未激活名单并跟基线差分。
-      let smoke: SmokeResult
-      try {
-        smoke = await io.runSmoke({ profileDir: profile.dir, tmpRoot: io.tmpRoot })
-      } catch (error) {
-        smoke = {
-          ok: false,
-          health: false,
-          failures: [{ kind: 'boot', message: '冒烟执行失败：' + messageOf(error) }],
-          failedEntries: [],
-          durationMs: 0,
-        }
-      }
-      if (cancelled) {
-        // 冒烟已经跑完（没法中途杀），但这轮结论不写盘、也不当成通过。
-        cancelledPayload(smoke)
-        return
-      }
-      const previous = await safeReadLast(io, io.logDir)
-      const { added } = diffFailedEntries(smoke.failedEntries, previous.baseline ?? [])
-      const newEntrySet = new Set(added)
-      // 没激活的插件同样是「提示」：试跑已经证明服务能起来，起不来会在 smoke.failures 里。
-      // 与上次通过的基线不同的那几条再额外标一句，方便看出「这次新弄坏的」是谁。
-      const bootWarnings: Failure[] = smoke.failedEntries.map((entry) => ({
-        plugin: entry,
-        kind: 'boot',
-        message: newEntrySet.has(entry)
-          ? `${entry} 没有激活（不在上次通过的基线里）`
-          : `${entry} 没有激活（上次通过时也是这样）`,
-      }))
-      const bootFailures = smoke.failures
-      // runSmoke.ok 已包含 health 200 与「临时目录 / 进程组清理干净」。
-      const bootOk = smoke.ok && smoke.health && bootFailures.length === 0
-      write({
-        stage: 'boot',
-        ok: bootOk,
-        failures: bootFailures,
-        warnings: bootWarnings,
-        entries: smoke.failedEntries,
-        added,
-        health: smoke.health,
-      })
-
-      const ok = configFailures.length === 0 && bootOk
-      const failures = [...configFailures, ...bootFailures]
-      const warnings = [...pluginWarnings, ...bootWarnings]
-
-      let fingerprint: string | null = null
-      try {
-        fingerprint = await io.computeFingerprint(profile.dir, version)
-      } catch {
-        fingerprint = null
-      }
-
-      if (cancelled) {
-        cancelledPayload(smoke)
-        return
-      }
-
-      let saveError: string | undefined
-      if (fingerprint !== null) {
-        const result: PrecheckResult = {
-          at: io.now().toISOString(),
-          ok,
-          fingerprint,
-          failures,
-          warnings,
-          durationMs: Math.max(0, Date.now() - startedAt),
-        }
+      const write = (payload: unknown): void => {
+        // writableEnded 之外还要看 destroyed：客户端断开后底层 socket 已不在，
+        // 但 Node 允许 write() 不抛错，这里必须主动停，避免每阶段空写。
+        if (res.writableEnded) return
+        if ((res as { destroyed?: boolean }).destroyed === true) return
         try {
-          // 通过：记 precheck + 本次完整名单做基线；不通过：也同步指纹（Task 2 的不变量），
-          // 但基线不动。这样 status 能分清「通过后 profile 又变了」和「上次就没过」。
-          const patch: Partial<LastRecord> = ok
-            ? { precheck: result, baseline: [...smoke.failedEntries].sort(), fingerprint }
-            : { precheck: result, fingerprint }
-          await io.writeLast(io.logDir, patch)
+          res.write(JSON.stringify(payload) + '\n')
         } catch (error) {
-          saveError = '预检结果写盘失败：' + messageOf(error)
+          console.error('[dsh-restart] NDJSON 写失败：' + messageOf(error))
         }
       }
-      // fingerprint 为 null：结果绑不到当前 profile，不写盘；status 会一直判过期。
-      // 因此 done 里必须带 saved:false，别让客户端把「阶段都绿了」当成可用的通过结论。
 
-      if (saveError !== undefined) {
-        console.error('[dsh-restart] ' + saveError)
-        write({ done: true, ok: false, saved: false, error: saveError })
-      } else if (fingerprint === null) {
-        // 阶段结论本身是 ok，但没落盘：让客户端用 saved 区分，别只看 ok。
-        write({ done: true, ok, saved: false, reason: 'fingerprint-unavailable' })
-      } else {
-        write({ done: true, ok, saved: true, fingerprint })
+      // 取消时补一条 boot 行 + done 行：客户端至少知道这轮没结论，而不是连接莫名其妙断掉。
+      const cancelledPayload = (outcome: PrecheckOutcome): void => {
+        write({
+          stage: 'boot',
+          ok: false,
+          cancelled: true,
+          failures: outcome.failures,
+          warnings: [],
+          entries: outcome.entries,
+          added: [],
+          health: outcome.health,
+        })
+        write({ done: true, ok: false, saved: false, cancelled: true, reason: 'cancelled' })
       }
+
       try {
-        res.end()
-      } catch {
-        // 客户端先断了。
-      }
-    } catch (error) {
-      console.error('[dsh-restart] 预检异常终止：' + messageOf(error))
-      write({ done: true, ok: false, saved: false, error: '预检异常终止：' + messageOf(error) })
-      try {
-        res.end()
-      } catch {
-        // 同上。
+        // 取消检查点、逐段进度都在核心模块里；这里只做 NDJSON 映射。
+        const outcome = await runPrecheckRun(io, profile, {
+          onStage: (stage) => write(stage),
+          isCancelled: () => cancelled,
+        })
+        if (outcome.cancelled) {
+          cancelledPayload(outcome)
+        } else if (outcome.error !== undefined) {
+          write({ done: true, ok: false, saved: false, error: outcome.error })
+        } else if (!outcome.saved) {
+          // 阶段结论本身是 ok，但没落盘：让客户端用 saved 区分，别只看 ok。
+          write({ done: true, ok: outcome.ok, saved: false, reason: 'fingerprint-unavailable' })
+        } else {
+          write({ done: true, ok: outcome.ok, saved: true, fingerprint: outcome.fingerprint })
+        }
+      } catch (error) {
+        // 核心自己兜异常；这里只兜回调 / 写响应抛出来的那类。
+        console.error('[dsh-restart] 预检异常终止：' + messageOf(error))
+        write({ done: true, ok: false, saved: false, error: '预检异常终止：' + messageOf(error) })
       }
     } finally {
       // 409 那条分支在加锁前就返回了，这里只负责释放真正跑起来的那一轮。
-      precheckRunning = false
+      releasePrecheck()
+      if (!res.writableEnded) {
+        try {
+          res.end()
+        } catch {
+          // 客户端已经走了。
+        }
+      }
     }
   }
 
@@ -690,14 +567,6 @@ async function safeFingerprint(io: RouteIo, profileDir: string, version: string 
     return await io.computeFingerprint(profileDir, version)
   } catch {
     return null
-  }
-}
-
-async function stage(kind: Failure['kind'], run: () => Promise<Failure[]>): Promise<Failure[]> {
-  try {
-    return await run()
-  } catch (error) {
-    return [{ kind, message: '快检执行失败：' + messageOf(error) }]
   }
 }
 
