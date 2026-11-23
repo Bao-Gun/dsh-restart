@@ -349,7 +349,7 @@ function defaultStartWeb(options: StartWebOptions): WebLaunchResult {
   try {
     const child = spawnProcess(
       command,
-      ['web', '--profile', options.profileName, '--port', String(options.port), '--no-open'],
+      ['--profile', options.profileName, '--port', String(options.port), '--no-open'],
       {
         detached: true,
         stdio: ['ignore', options.logFd, options.logFd],
@@ -539,7 +539,7 @@ export async function runRestartHelper(
       write('旧 web 已退出，开始自拉起')
     }
 
-    write(`自拉起：dsh web --profile ${profileName} --port ${port} --no-open`)
+    write(`自拉起：dsh --profile ${profileName} --port ${port} --no-open`)
     const launch = startWeb({ logFd, profileName, port, env: webEnv(profileDir) })
     if (launch.error !== undefined) {
       write(`自拉起失败：${launch.error}`)

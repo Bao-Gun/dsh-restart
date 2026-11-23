@@ -47,7 +47,7 @@
 - **冒烟用 APFS 克隆，不用硬链接。** `cp -c`（clonefile）写时复制，快到忽略不计，且试跑的写入不会落到正在跑的 profile 上——硬链接会共享 inode，试跑写日志、写 auth 文件、写会话都会写进线上状态。
 - **端口冲突不算红。** 试跑环境与线上必然抢 18787、18887 这类固定端口，冲突进基线，不阻断。
 - **不回写运行中的 profile。** 预检全程不碰 `~/.dsh/profiles/web`。
-- **重启的执行者是 helper，不是本进程。** daemon 被暂停或没装时会先 SIGTERM 再等端口，本进程会在半路死掉、拿不到结果；所以 fork 一个脱离的 helper，它先试 daemon，端口没回来就自己 `--no-open` 拉起，顺带压掉 daemon 默认开新标签页的行为。
+- **重启的执行者是 helper，不是本进程。** daemon 被暂停或没装时会先 SIGTERM 再等端口，本进程会在半路死掉、拿不到结果；所以 fork 一个脱离的 helper，它先试 daemon，端口没回来就自己 `--no-open` 拉起，顺带压掉 daemon 默认开新标签页的行为。自拉起的命令是 `dsh --profile <name> --port <port> --no-open`：profile 只能指定一次，位置参数 `web` 和 `--profile web` 同时出现会被 CLI 拒绝。
 - **两个 POST 不收无来历的请求**：校验 `Origin`/`Host` 与自身一致，且要求自定义头 `X-DSH-Restart`（跨站发不出来）。本机单用户也照做——将来开到 LAN 或隧道后面，这就是远程关机按钮。
 - **上次结果会过期。** `last.json` 带 profile 指纹（lockfile 摘要 + dsh 版本）；对不上就显「已过期，需重新检查」，按钮回到灰禁。装完插件看到的是上一次的「通过」，正是最危险的那一刻。
 - **判定回来不能只看 `/health`**：插件自己的 status 也要 200。

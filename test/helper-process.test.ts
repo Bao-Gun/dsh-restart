@@ -88,6 +88,17 @@ describe('helper 真进程', () => {
           "import { createServer } from 'node:http'",
           "import { writeFileSync } from 'node:fs'",
           '',
+          // 假 dsh 顺便当参数契约的哨兵：helper 必须用「--profile <name>」而不是
+          // 位置参数 web + --profile（dsh 会报 select a profile only once）。
+          'const argv = process.argv.slice(2)',
+          "if (argv[0] !== '--profile' || argv[1] !== 'web') {",
+          "  console.error('unexpected argv: ' + argv.join(' '))",
+          '  process.exit(2)',
+          '}',
+          "if (!argv.includes('--no-open')) {",
+          "  console.error('missing --no-open')",
+          '  process.exit(3)',
+          '}',
           "const index = process.argv.indexOf('--port')",
           'const port = Number(process.argv[index + 1])',
           'const server = createServer((req, res) => {',
@@ -140,7 +151,7 @@ describe('helper 真进程', () => {
         expect(logName).toBeDefined()
         const log = await readFile(join(logDir, logName as string), 'utf8')
         expect(log).toContain('dsh-daemon restart 退出 code=1')
-        expect(log).toContain('自拉起：dsh web --profile web --port')
+        expect(log).toContain('自拉起：dsh --profile web --port')
         expect(log).toContain('web healthy on port')
         expect(log).toContain('fake dsh web listening on')
         expect(names.includes(RESTART_LOCK_NAME)).toBe(false)

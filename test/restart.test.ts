@@ -253,7 +253,7 @@ describe('runRestartHelper', () => {
     expect(starts[0]?.env.DSH_DAEMON_OPEN_BROWSER).toBe('0')
     expect(starts[0]?.env.DSH_HOME).toBe(dir)
     const lines = await logLines()
-    expect(lines.some((line) => line.includes('自拉起：dsh web --profile web --port 3080 --no-open'))).toBe(true)
+    expect(lines.some((line) => line.includes('自拉起：dsh --profile web --port 3080 --no-open'))).toBe(true)
     expect(lines.some((line) => line.includes('web healthy on port 3080'))).toBe(true)
   })
 
