@@ -32,7 +32,7 @@
 2. 点击 → 弹窗 `GET /dsh-restart/api/status`：端口、健康、上次结果（带指纹判定是否过期），一次填满。
 3. 点「开始模拟检查」→ `POST /dsh-restart/api/precheck` → 快检 A → 快检 B → 冒烟 C，阶段通过 NDJSON 流（每阶段一行，结尾 `{"done":true}`）推给弹窗，结果写 `last.json`。
 4. 点「重启 dsh web」→ `POST /dsh-restart/api/restart` 先回 202，在 `res.end()` 之后的 `finish` 事件里 fork 脱离 helper（响应必须真的落到 socket，不能用固定延时赌）。
-5. 弹窗轮询 `/health` 与 `/dsh-restart/api/status`，两个都 200 才显示「已回来」，90 秒超时报红。
+5. 弹窗轮询 `/dsh-restart/api/status`：先见过「重启中」（`restarting: true`）或连不上，再看到 `health: true` 且端口是数字，才显示「已回来」；90 秒超时报红并恢复「开始检查」。只看 `health` 会被还没退出的旧进程骗过去。
 
 ## 通过 / 不通过怎么算
 
@@ -50,6 +50,8 @@
 - **重启的执行者是 helper，不是本进程。** daemon 被暂停或没装时会先 SIGTERM 再等端口，本进程会在半路死掉、拿不到结果；所以 fork 一个脱离的 helper，它先试 daemon，端口没回来就自己 `--no-open` 拉起，顺带压掉 daemon 默认开新标签页的行为。自拉起的命令是 `dsh --profile <name> --port <port> --no-open`：profile 只能指定一次，位置参数 `web` 和 `--profile web` 同时出现会被 CLI 拒绝。总预算是 `waitMs`（默认 60s）+ 插件宽限（默认 5s），自拉起和接管只用剩余额度，落在弹窗 90 秒超时之内。插件宽限的取值顺序是 deps → opts → 5s，helper 从 `DSH_RESTART_PLUGIN_GRACE_MS` 解析出的值必须经 opts 生效；start 日志行带 `home=… profile=… source=explicit|derived`，用于事后判断这次用的是显式路径还是反推值。
 - **两个 POST 不收无来历的请求**：先过宿主 `connection.requestRejection`（Host/Origin 与浏览器/API 凭据），再要求 `Origin` 与 `Host` 一致、且带自定义头 `X-DSH-Restart: 1`（跨站发不出来）。本机单用户也照做——将来开到 LAN 或隧道后面，这就是远程关机按钮。唯一例外是 helper 重启后的只读就绪探针：回环地址 + `GET /dsh-restart/api/status` + 带头 + 无 Origin 时，宿主的 401 被当作放行；`precheck` / `restart` 永不享受这个例外。
 - **上次结果会过期。** `last.json` 带 profile 指纹（lockfile 摘要 + dsh 版本）；对不上就显「已过期，需重新检查」，按钮回到灰禁。装完插件看到的是上一次的「通过」，正是最危险的那一刻。
+- **门禁只认本轮结果。** 一旦点了「开始检查」，上一次的「通过」立刻作废：本轮只要有任何一段红，按钮就回到 disabled，只剩「我知道风险，直接重启」。`roundRan ? localPassed : payloadPassed`——写成 `localPassed || payloadPassed` 会让「上次通过 + 本次失败」仍然可点，正是最该拦住的那条路。
+- **关掉弹窗就放弃在飞请求。** 每次请求带 `AbortController`，`close()` 统一 abort 并递增 token；服务端靠 `res.once('close')` 中止冒烟、不写 `last.json`。回包回到已关闭/已重开的弹窗前先比 token，不画进新弹窗。
 - **判定回来不能只看 `/health`**：插件自己的 status 也要 200；探不到就报「插件未加载」，不能显示「已重启」——用错 profile/DSH_HOME 的进程同样 200 `/health`，但侧栏里没有按钮。
 
 ## 范围

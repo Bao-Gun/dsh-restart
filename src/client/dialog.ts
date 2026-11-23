@@ -6,9 +6,11 @@
  * 表现为普通失败，不会静默当成功。
  *
  * 门禁规则（见 docs/superpowers/specs/2026-11-23-restart-button-design.md）：
- * - 只有「本次预检全过」或「上次预检通过且指纹没过期」才允许点重启；
+ * - 没跑本轮预检时，status 里「上次通过且指纹没过期」的结论可以点亮按钮；
+ * - 一旦点了「开始检查」，上一次的结论立刻作废：本轮全过才允许重启，本轮判红就一直禁用
+ *   （「上次通过 + 本次失败」正是设计稿点名的最危险路径）；
  * - 不满足时按钮 disabled，旁边给一条小字退路，走 confirm() 二次确认；
- * - 重启后轮询 status，`health === true` 且拿到端口才算回来，超时转红。
+ * - 重启后轮询 status，要先见过「重启中/连不上」，再用 `health === true` 且非 restarting 判回来。
  */
 import type { Failure, LastRecord } from '../shared/types'
 import { ensureDialogStyle } from './dialog.css'
@@ -38,6 +40,8 @@ const DEFAULT_TIMEOUT_MS = 90_000
 export interface DialogRequestInit {
   method?: string
   headers?: Record<string, string>
+  /** 关弹窗/重新开跑时中止在飞请求，服务端才能收到连接关闭并停掉冒烟。 */
+  signal?: AbortSignal
 }
 
 /** fetch 响应的最小结构；测试里用假实现替换，不碰真实网络。 */
@@ -87,6 +91,7 @@ interface DialogView {
   precheck: HTMLButtonElement
   restart: HTMLButtonElement
   force: HTMLButtonElement
+  closeButton: HTMLButtonElement
   onKeydown: (event: KeyboardEvent) => void
 }
 
@@ -104,6 +109,19 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
   let localPassed = false
   /** status 里的上次预检通过且指纹没过期。 */
   let payloadPassed = false
+  /**
+   * 本次打开后是否真的点过「开始检查」。
+   *
+   * 跑过本轮之后，上一次 payload 的结论就作废：只看本轮结果。否则「上次通过 + 本次判红」
+   * 会让按钮重新点亮，正好是设计稿点名的最危险路径。
+   */
+  let roundRan = false
+  /** 在飞请求的中止器：close()/重新开跑时全部 abort。 */
+  const inflight = new Set<AbortController>()
+  /** 每次 open/close/重新开跑都 +1；旧回包对不上就整段丢弃。 */
+  let token = 0
+  /** 弹窗打开前的焦点，关闭时还回去。 */
+  let lastFocus: Element | null = null
 
   const stopPolling = (): void => {
     if (timer !== null) {
@@ -112,40 +130,64 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
     }
   }
 
-  const setNotice = (text: string, state: 'ok' | 'warn' | 'error' | 'none' = 'none'): void => {
-    if (view === null) return
-    view.notice.textContent = text
-    if (state === 'none') delete view.notice.dataset.state
-    else view.notice.dataset.state = state
+  const setNotice = (text: string, state: 'ok' | 'warn' | 'error' | 'none' = 'none', target: DialogView | null = view): void => {
+    if (target === null) return
+    target.notice.textContent = text
+    if (state === 'none') delete target.notice.dataset.state
+    else target.notice.dataset.state = state
   }
 
   const refreshGate = (): void => {
     if (view === null) return
-    const passed = localPassed || payloadPassed
+    // 跑过本轮就只认本轮结果；没跑过才轮到 status 里的旧结论。
+    const passed = roundRan ? localPassed : payloadPassed
     view.restart.disabled = !passed
     // 没通过时才给退路；通过时那条小字没有意义。
     view.force.hidden = passed
   }
 
-  const request = async (url: string, method: string): Promise<DialogResponse> => {
-    return fetchImpl(url, { method, headers: { ...REQUEST_HEADER } })
+  /** 每条请求一个中止器，登记在 inflight 里，close() 时统一 abort。 */
+  const beginRequest = (): { signal: AbortSignal, done: () => void } => {
+    const controller = new AbortController()
+    inflight.add(controller)
+    return {
+      signal: controller.signal,
+      done: () => {
+        inflight.delete(controller)
+      },
+    }
   }
 
-  const loadStatus = async (): Promise<void> => {
-    if (view === null) return
+  const abortInflight = (): void => {
+    for (const controller of inflight) controller.abort()
+    inflight.clear()
+  }
+
+  const request = async (url: string, method: string, signal?: AbortSignal): Promise<DialogResponse> => {
+    return fetchImpl(url, { method, headers: { ...REQUEST_HEADER }, signal })
+  }
+
+  /** 弹窗关闭/重开后旧回包一律丢弃：view 换了或 token 变了都算过期。 */
+  const live = (target: DialogView, ticket: number): boolean => view === target && ticket === token
+
+  const loadStatus = async (target: DialogView, ticket: number): Promise<void> => {
+    const { signal, done } = beginRequest()
     try {
-      const response = await request(API.status, 'GET')
+      const response = await request(API.status, 'GET', signal)
       if (!response.ok) throw new Error('HTTP ' + response.status)
       const payload = parseStatus(await response.json())
-      if (view === null) return
-      renderStatus(view, payload)
-      payloadPassed = passedByPayload(payload)
+      if (!live(target, ticket)) return
+      renderStatus(target, payload)
+      // 跑过本轮之后，旧的 status 不再有放行权。
+      payloadPassed = !roundRan && passedByPayload(payload)
       refreshGate()
     } catch (error) {
-      if (view === null) return
-      view.health.textContent = '读不到状态'
-      view.last.textContent = '读不到上次结果'
-      setNotice('读状态失败：' + messageOf(error) + '（宿主服务端可能没起来）', 'error')
+      if (!live(target, ticket) || isAbort(error)) return
+      target.health.textContent = '读不到状态'
+      target.last.textContent = '读不到上次结果'
+      setNotice('读状态失败：' + messageOf(error) + '（宿主服务端可能没起来）', 'error', target)
+    } finally {
+      done()
     }
   }
 
@@ -154,11 +196,11 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
     target.health.textContent = payload.health === true ? '正常' : '探不到 /health'
     target.last.textContent = lastText(payload)
     if (payload.restarting === true) {
-      setNotice('已经有一个重启在进行中，等它回来。', 'warn')
+      setNotice('已经有一个重启在进行中，等它回来。', 'warn', target)
       return
     }
     if (payload.stale === true && payload.last?.precheck !== undefined && payload.last.precheck !== null) {
-      setNotice('指纹变了：上次「通过」是旧配置的结论，请重新检查。', 'warn')
+      setNotice('指纹变了：上次「通过」是旧配置的结论，请重新检查。', 'warn', target)
     }
   }
 
@@ -194,15 +236,21 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
     target.precheck.textContent = '开始检查'
     localPassed = false
     payloadPassed = false
+    roundRan = false
     refreshGate()
   }
 
   const runPrecheck = async (): Promise<void> => {
     if (view === null) return
     const target = view
+    const ticket = ++token
+    const { signal, done } = beginRequest()
+    // 本轮开始：上一次的结论立刻作废，检查期间按钮必须是暗的。
+    roundRan = true
+    localPassed = false
+    payloadPassed = false
     target.precheck.disabled = true
     target.precheck.textContent = '检查中…'
-    localPassed = false
     refreshGate()
     target.failures.textContent = ''
     delete target.notice.dataset.state
@@ -213,9 +261,14 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
     let sawDone = false
 
     try {
-      const response = await request(API.precheck, 'POST')
+      const response = await request(API.precheck, 'POST', signal)
+      if (response.status === 409) {
+        const payload = await safeJson(response)
+        throw new Error(typeof payload.error === 'string' ? payload.error : '已有一轮预检在进行，等它结束再试')
+      }
       if (!response.ok) throw new Error('HTTP ' + response.status)
       await readNdjson(response, (line) => {
+        if (!live(target, ticket)) return
         if (typeof line !== 'object' || line === null) return
         const record = line as Record<string, unknown>
         if (record.done === true) {
@@ -230,17 +283,20 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
         results[stage] = ok
         renderStage(stage, ok, failures)
         if (!ok) failures.forEach(appendFailure)
-      })
+      }, signal)
 
+      if (!live(target, ticket)) return
       const allOk = sawDone && STAGES.every((stage) => results[stage] === true) && doneError === undefined
       localPassed = allOk
-      if (allOk) setNotice('检查全过，可以重启。', 'ok')
-      else setNotice(doneError ?? '预检没全过：先按上面的失败项修，再重试。', 'error')
+      if (allOk) setNotice('检查全过，可以重启。', 'ok', target)
+      else setNotice(doneError ?? '预检没全过：先按上面的失败项修，再重试。', 'error', target)
     } catch (error) {
+      if (!live(target, ticket) || isAbort(error)) return
       localPassed = false
-      setNotice('检查失败：' + messageOf(error), 'error')
+      setNotice('检查失败：' + messageOf(error), 'error', target)
     } finally {
-      if (view === target) {
+      done()
+      if (live(target, ticket)) {
         target.precheck.disabled = false
         target.precheck.textContent = '重新检查'
         refreshGate()
@@ -251,55 +307,82 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
   const startRestart = async (): Promise<void> => {
     if (view === null) return
     const target = view
+    const ticket = ++token
+    const { signal, done } = beginRequest()
     target.restart.disabled = true
     target.force.hidden = true
     target.precheck.disabled = true
-    setNotice('正在请求重启…')
+    setNotice('正在请求重启…', 'none', target)
 
     try {
-      const response = await request(API.restart, 'POST')
+      const response = await request(API.restart, 'POST', signal)
+      if (!live(target, ticket)) return
       if (response.status === 409) {
-        setNotice('已经有一个重启在进行中，等它回来。', 'warn')
+        const payload = await safeJson(response)
+        setNotice(typeof payload.error === 'string' ? payload.error : '已经有一个重启在进行中，等它回来。', 'warn', target)
         target.precheck.disabled = false
         refreshGate()
         return
       }
       if (!response.ok) throw new Error('HTTP ' + response.status)
-      setNotice('重启已发起，等服务回来…（最长 ' + Math.round(timeoutMs / 1000) + ' 秒）', 'ok')
-      pollUntilBack()
+      setNotice('重启已发起，等服务回来…（最长 ' + Math.round(timeoutMs / 1000) + ' 秒）', 'ok', target)
+      pollUntilBack(target, ticket)
     } catch (error) {
-      setNotice('重启请求失败：' + messageOf(error), 'error')
+      if (!live(target, ticket) || isAbort(error)) return
+      setNotice('重启请求失败：' + messageOf(error), 'error', target)
       target.precheck.disabled = false
       refreshGate()
+    } finally {
+      done()
     }
   }
 
-  const pollUntilBack = (): void => {
+  /**
+   * 轮询等服务回来。
+   *
+   * 只认 `health === true && port 是数字` 不够：helper 还没把旧进程干掉时，旧进程会照常回
+   * 200 + health:true，客户端就会误报「已经回来」。所以必须先见过「重启中」（restarting）
+   * 或「连不上」，才把后面的健康响应当成新进程。
+   */
+  const pollUntilBack = (target: DialogView, ticket: number): void => {
     stopPolling()
     const startedAt = Date.now()
+    let sawDownOrLocked = false
     const tick = async (): Promise<void> => {
       timer = null
-      if (disposed || view === null) return
-      if (!view.root.isConnected) return
+      if (!live(target, ticket) || !target.root.isConnected) return
+      const { signal, done } = beginRequest()
       try {
-        const response = await request(API.status, 'GET')
-        if (response.ok) {
+        const response = await request(API.status, 'GET', signal)
+        if (!live(target, ticket)) return
+        if (!response.ok) {
+          sawDownOrLocked = true
+        } else {
           const payload = parseStatus(await response.json())
-          if (payload.health === true && typeof payload.port === 'number') {
-            setNotice('已经回来，刷新页面就能用新插件了。', 'ok')
-            if (view !== null) {
-              view.health.textContent = '正常'
-              view.port.textContent = String(payload.port)
-              view.precheck.disabled = false
-            }
+          if (!live(target, ticket)) return
+          if (payload.restarting === true) sawDownOrLocked = true
+          const back = payload.restarting !== true && payload.health === true && typeof payload.port === 'number'
+          if (sawDownOrLocked && back) {
+            setNotice('已经回来，刷新页面就能用新插件了。', 'ok', target)
+            target.health.textContent = '正常'
+            target.port.textContent = String(payload.port)
+            target.precheck.disabled = false
             return
           }
         }
-      } catch {
+      } catch (error) {
+        if (isAbort(error)) return
         // dsh web 正在重启，连接被拒/超时都是预期内的，继续等。
+        sawDownOrLocked = true
+      } finally {
+        done()
       }
+      if (!live(target, ticket)) return
       if (Date.now() - startedAt >= timeoutMs) {
-        setNotice('超时：' + Math.round(timeoutMs / 1000) + ' 秒内服务没回来。去终端看 dsh web 的日志。', 'error')
+        setNotice('超时：' + Math.round(timeoutMs / 1000) + ' 秒内服务没回来。去终端看 dsh web 的日志。', 'error', target)
+        // 超时别把弹窗锁死：还能重新查状态、重新判断。
+        target.precheck.disabled = false
+        refreshGate()
         return
       }
       timer = setTimeout(() => {
@@ -313,11 +396,18 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
 
   const close = (): void => {
     stopPolling()
+    // 关掉就放弃在飞请求：服务端要收到连接关闭才会中止冒烟、不写 last.json。
+    token += 1
+    abortInflight()
     if (view !== null) {
       doc.removeEventListener('keydown', view.onKeydown)
       view.root.remove()
       view = null
     }
+    if (lastFocus !== null && lastFocus.isConnected && typeof (lastFocus as HTMLElement).focus === 'function') {
+      ;(lastFocus as HTMLElement).focus()
+    }
+    lastFocus = null
   }
 
   const open = (): void => {
@@ -340,9 +430,15 @@ export function mountDialog(doc: Document, options: MountDialogOptions = {}): Mo
       })
       ;(doc.body ?? doc.documentElement).appendChild(view.root)
     }
-    view.root.hidden = false
-    resetView(view)
-    void loadStatus()
+    const target = view
+    lastFocus = doc.activeElement
+    target.root.hidden = false
+    resetView(target)
+    // 上一次打开遗留的请求（没走 close 的情况）一并放弃。
+    abortInflight()
+    const ticket = ++token
+    target.closeButton.focus()
+    void loadStatus(target, ticket)
   }
 
   return {
@@ -495,7 +591,7 @@ function buildDialog(doc: Document, handlers: DialogHandlers): DialogView {
   })
   doc.addEventListener('keydown', onKeydown)
 
-  return { root, port, health, last, notice, stages, failures, precheck, restart, force, onKeydown }
+  return { root, port, health, last, notice, stages, failures, precheck, restart, force, closeButton, onKeydown }
 }
 
 function section(doc: Document, label: string): { root: HTMLElement, body: HTMLElement } {
@@ -572,7 +668,10 @@ function parseFailures(value: unknown): Failure[] {
 }
 
 type StreamBody = {
-  getReader(): { read(): Promise<{ done: boolean, value?: Uint8Array }> }
+  getReader(): {
+    read(): Promise<{ done: boolean, value?: Uint8Array }>
+    cancel?(): Promise<void>
+  }
 }
 
 /**
@@ -581,17 +680,27 @@ type StreamBody = {
  * 优先流式读（阶段一到就画一到，用户不用干等整包），服务端只给整包文本时退回 text()。
  * 每行独立 try/catch：某一行坏了不该把已经画出来的阶段抹掉。
  */
-async function readNdjson(response: DialogResponse, onLine: (line: unknown) => void): Promise<void> {
+async function readNdjson(
+  response: DialogResponse,
+  onLine: (line: unknown) => void,
+  signal?: AbortSignal,
+): Promise<void> {
   const body = response.body as StreamBody | null | undefined
   if (body !== null && body !== undefined && typeof body.getReader === 'function') {
     const reader = body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
     for (;;) {
+      if (signal?.aborted === true) {
+        // 弹窗关了：主动放掉这条流，别让服务端以为客户端还在等。
+        if (typeof reader.cancel === 'function') await reader.cancel()
+        return
+      }
       const chunk = await reader.read()
       if (chunk.value !== undefined && chunk.value !== null) buffer += decoder.decode(chunk.value, { stream: true })
-      if (chunk.done === true) break
+      // 先 drain 再判 done：最后一包里可能挤着两行，done 也可能和数据同块。
       buffer = drainLines(buffer, onLine)
+      if (chunk.done === true) break
     }
     buffer += decoder.decode()
     const tail = buffer.trim()
@@ -644,4 +753,19 @@ function defaultConfirm(doc: Document): (message: string) => boolean {
 function messageOf(error: unknown): string {
   if (error instanceof Error) return error.message
   return String(error)
+}
+
+/** abort 是关弹窗的正常路径，不该被当成「检查失败」画到界面上。 */
+function isAbort(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as { name?: unknown }).name === 'AbortError'
+}
+
+/** 读响应体里的 error 文案（409 这类），读不出来就当空对象。 */
+async function safeJson(response: DialogResponse): Promise<Record<string, unknown>> {
+  try {
+    const payload = await response.json()
+    return typeof payload === 'object' && payload !== null ? (payload as Record<string, unknown>) : {}
+  } catch {
+    return {}
+  }
 }

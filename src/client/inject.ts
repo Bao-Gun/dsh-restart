@@ -132,8 +132,15 @@ function injectIntoMenu(doc: Document, onOpen: () => void): boolean {
 function injectIntoLauncher(doc: Document, onOpen: () => void): boolean {
   const launcher = doc.querySelector('[data-slot="settings.launcher"]')
   if (launcher === null) return false
-  const previous = launcher.previousElementSibling
-  if (previous !== null && previous.hasAttribute(LAUNCHER_ROW_ATTR)) return true
+  const parent = launcher.parentElement
+  if (parent === null) return false
+  // 幂等看整棵父节点：宿主可能在退路行与 launcher 之间插包裹层或分隔线，
+  // 只看 previousElementSibling 会插出第二行。
+  const existing = Array.from(parent.querySelectorAll('[' + LAUNCHER_ROW_ATTR + ']'))
+  if (existing.length > 0) {
+    for (const extra of existing.slice(1)) extra.remove()
+    return true
+  }
 
   const trigger = launcher.querySelector('button')
   const row = doc.createElement('button')
@@ -161,8 +168,6 @@ function injectIntoLauncher(doc: Document, onOpen: () => void): boolean {
   }
   row.addEventListener('click', () => onOpen())
 
-  const parent = launcher.parentElement
-  if (parent === null) return false
   parent.insertBefore(row, launcher)
   return true
 }
@@ -177,8 +182,11 @@ function looksLikeAccountMenu(menu: Element): boolean {
 }
 
 function menuitemsOf(menu: Element): HTMLButtonElement[] {
+  // 观察器回调里可能拿到已从文档摘除的子树（React 卸载中途），defaultView 会是 null。
+  const win = menu.ownerDocument.defaultView
+  if (win === null) return []
   return Array.from(menu.querySelectorAll('button[role="menuitem"]')).filter(
-    (item): item is HTMLButtonElement => item instanceof item.ownerDocument.defaultView!.HTMLButtonElement,
+    (item): item is HTMLButtonElement => item instanceof win.HTMLButtonElement,
   )
 }
 

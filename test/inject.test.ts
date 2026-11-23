@@ -179,7 +179,7 @@ describe('injectMenuRow：找不到菜单时的退路', () => {
 /* 弹窗                                                                */
 /* ------------------------------------------------------------------ */
 
-type FetchCall = { url: string; init: { method?: string; headers?: Record<string, string> } }
+type FetchCall = { url: string; init: { method?: string; headers?: Record<string, string>; signal?: AbortSignal } }
 
 interface FakeResponse {
   ok: boolean
@@ -252,6 +252,88 @@ function fakeFetch(routes: Record<string, FakeResponse | (() => FakeResponse)>):
 
 async function settle(): Promise<void> {
   for (let i = 0; i < 12; i += 1) await Promise.resolve()
+}
+
+/** 一条永远读不完的 NDJSON 流：用来验证 close() 有没有真的 abort + cancel。 */
+function slowStream(line: Record<string, unknown>): {
+  response: FakeResponse
+  state: { reads: number; cancelled: boolean }
+} {
+  const state = { reads: 0, cancelled: false }
+  const encoder = new TextEncoder()
+  const response: FakeResponse = {
+    ok: true,
+    status: 200,
+    json: async () => ({}),
+    text: async () => '',
+    body: {
+      getReader() {
+        return {
+          async read() {
+            state.reads += 1
+            if (state.cancelled) return { done: true as const, value: undefined }
+            await wait(10)
+            if (state.cancelled) return { done: true as const, value: undefined }
+            return { done: false as const, value: encoder.encode(JSON.stringify(line) + '\n') }
+          },
+          async cancel() {
+            state.cancelled = true
+          },
+        }
+      },
+    },
+  }
+  return { response, state }
+}
+
+/** 手动推行的 NDJSON 流：验证「一条 stage 到就渲染一条」，而不是等整包。 */
+function manualNdjson(): { response: FakeResponse; push(text: string): void; finish(): void } {
+  const encoder = new TextEncoder()
+  const queue: string[] = []
+  let pending: ((chunk: { done: boolean; value?: Uint8Array }) => void) | null = null
+  let finished = false
+  const response: FakeResponse = {
+    ok: true,
+    status: 200,
+    json: async () => ({}),
+    text: async () => '',
+    body: {
+      getReader() {
+        return {
+          read() {
+            const next = queue.shift()
+            if (next !== undefined) return Promise.resolve({ done: false, value: encoder.encode(next) })
+            if (finished) return Promise.resolve({ done: true, value: undefined })
+            return new Promise((resolve) => {
+              pending = resolve
+            })
+          },
+        }
+      },
+    },
+  }
+  const push = (text: string): void => {
+    if (pending !== null) {
+      const resolve = pending
+      pending = null
+      resolve({ done: false, value: encoder.encode(text) })
+      return
+    }
+    queue.push(text)
+  }
+  const finish = (): void => {
+    finished = true
+    if (pending !== null) {
+      const resolve = pending
+      pending = null
+      resolve({ done: true, value: undefined })
+    }
+  }
+  return { response, push, finish }
+}
+
+function noticeText(): string {
+  return document.querySelector('.dsh-restart-notice')?.textContent?.trim() ?? ''
 }
 
 /**
@@ -422,5 +504,152 @@ describe('mountDialog：五段与状态', () => {
     const restartCall = calls.find((call) => call.url === '/dsh-restart/api/restart')
     expect(restartCall?.init.method).toBe('POST')
     expect(restartCall?.init.headers?.['x-dsh-restart']).toBe('1')
+  })
+
+  /* ---- 评审 C1/M1/M2 的回归用例 ---- */
+
+  it('上次通过 + 本次失败：重启按钮必须保持禁用（C1）', async () => {
+    const failing = [
+      JSON.stringify({ stage: 'config', ok: true, failures: [] }),
+      JSON.stringify({ stage: 'compat', ok: false, failures: [{ kind: 'compat', message: '插件版本不满足' }] }),
+      JSON.stringify({ stage: 'boot', ok: true, failures: [], entries: [], added: [], health: true }),
+      JSON.stringify({ done: true }),
+    ].join('\n') + '\n'
+    const { fetchImpl } = fakeFetch({
+      '/dsh-restart/api/status': jsonResponse(statusPayload({
+        last: { precheck: { at: '2026-11-23T03:00:00.000Z', ok: true, fingerprint: 'fp-1', failures: [], durationMs: 1200 } },
+      })),
+      '/dsh-restart/api/precheck': ndjsonResponse(failing),
+    })
+    const dialog = mountDialog(document, { fetchImpl })
+    dialog.open()
+
+    // 起点：上次通过，按钮可用（这是允许的，刷新页面不用重检）。
+    await waitFor(() => restartButton().disabled === false)
+
+    precheckButton().click()
+    await waitFor(() => precheckButton().disabled === false)
+
+    // 本轮判红之后，上一次的「通过」不能再放行。
+    expect(textOf('[data-dsh-restart-stage="compat"]')).toContain('未通过')
+    expect(restartButton().disabled).toBe(true)
+    expect((document.querySelector('[data-dsh-restart-force]') as HTMLButtonElement).hidden).toBe(false)
+  })
+
+  it('检查中关掉弹窗：在飞请求被 abort、流被 cancel（M1）', async () => {
+    const { response, state } = slowStream({ stage: 'config', ok: true, failures: [] })
+    const { calls, fetchImpl } = fakeFetch({
+      '/dsh-restart/api/status': jsonResponse(statusPayload()),
+      '/dsh-restart/api/precheck': response,
+    })
+    const dialog = mountDialog(document, { fetchImpl })
+    dialog.open()
+    await waitFor(() => precheckButton().disabled === false)
+
+    precheckButton().click()
+    await waitFor(() => state.reads > 0)
+    const precheckCall = calls.find((call) => call.url === '/dsh-restart/api/precheck')
+    expect(precheckCall?.init.signal?.aborted).toBe(false)
+
+    dialog.close()
+    await waitFor(() => state.cancelled === true)
+    expect(precheckCall?.init.signal?.aborted).toBe(true)
+    expect(dialogRoot()).toBeNull()
+  })
+
+  it('重启后要先见到 restarting 才判回来（M2）', async () => {
+    let statusCalls = 0
+    const { fetchImpl } = fakeFetch({
+      // 第一次是 open 的 status；第二次模拟「旧进程还没退出」；之后才是新进程。
+      '/dsh-restart/api/status': () => {
+        statusCalls += 1
+        if (statusCalls === 1) return jsonResponse(statusPayload({ last: {} }))
+        if (statusCalls === 2) return jsonResponse(statusPayload({ restarting: true, last: {} }))
+        return jsonResponse(statusPayload({ restarting: false, port: 3080, last: {} }))
+      },
+      '/dsh-restart/api/precheck': ndjsonResponse([
+        JSON.stringify({ stage: 'config', ok: true, failures: [] }),
+        JSON.stringify({ stage: 'compat', ok: true, failures: [] }),
+        JSON.stringify({ stage: 'boot', ok: true, failures: [], entries: [], added: [], health: true }),
+        JSON.stringify({ done: true }),
+      ].join('\n') + '\n'),
+      '/dsh-restart/api/restart': jsonResponse({ ok: true, at: '2026-11-23T04:00:01.000Z', port: 3080 }, 202),
+    })
+    const dialog = mountDialog(document, { fetchImpl, pollIntervalMs: 40, timeoutMs: 2000 })
+    dialog.open()
+    await waitFor(() => precheckButton().disabled === false)
+    precheckButton().click()
+    await waitFor(() => restartButton().disabled === false)
+    restartButton().click()
+
+    await waitFor(() => statusCalls >= 2)
+    // 这一包是旧进程（restarting:true），不许显示「已经回来」。
+    expect(noticeText()).not.toContain('已经回来')
+
+    await waitFor(() => noticeText().includes('已经回来'))
+    expect(textOf('[data-dsh-restart-port]')).toContain('3080')
+  })
+
+  it('NDJSON 每条 stage 到达就渲染，不等整包（M3）', async () => {
+    const stream = manualNdjson()
+    const { fetchImpl } = fakeFetch({
+      '/dsh-restart/api/status': jsonResponse(statusPayload({ last: {} })),
+      '/dsh-restart/api/precheck': stream.response,
+    })
+    const dialog = mountDialog(document, { fetchImpl })
+    dialog.open()
+    await waitFor(() => precheckButton().disabled === false)
+    precheckButton().click()
+
+    stream.push(JSON.stringify({ stage: 'config', ok: true, failures: [] }) + '\n')
+    await waitFor(() => textOf('[data-dsh-restart-stage="config"]').includes('通过'))
+    // done 还没来：不能提前宣布全过。
+    expect(textOf('[data-dsh-restart-stage="compat"]')).toContain('未检查')
+    expect(restartButton().disabled).toBe(true)
+
+    stream.push(JSON.stringify({ stage: 'compat', ok: true, failures: [] }) + '\n')
+    stream.push(JSON.stringify({ stage: 'boot', ok: true, failures: [], entries: [], added: [], health: true }) + '\n')
+    stream.push(JSON.stringify({ done: true }) + '\n')
+    stream.finish()
+    await waitFor(() => restartButton().disabled === false)
+  })
+
+  it('最后一包多行与 done 同块、且没有结尾换行，也不丢行（m1）', async () => {
+    const payload = [
+      JSON.stringify({ stage: 'config', ok: true, failures: [] }),
+      JSON.stringify({ stage: 'compat', ok: true, failures: [] }),
+      JSON.stringify({ stage: 'boot', ok: true, failures: [], entries: [], added: [], health: true }),
+      JSON.stringify({ done: true }),
+    ].join('\n')
+    const response: FakeResponse = {
+      ok: true,
+      status: 200,
+      json: async () => ({}),
+      text: async () => payload,
+      body: {
+        getReader() {
+          let served = false
+          return {
+            async read() {
+              if (served) return { done: true as const, value: undefined }
+              served = true
+              // 唯一一包：四行挤在一起，done 与数据同块，末尾没有换行。
+              return { done: true as const, value: new TextEncoder().encode(payload) }
+            },
+          }
+        },
+      },
+    }
+    const { fetchImpl } = fakeFetch({
+      '/dsh-restart/api/status': jsonResponse(statusPayload({ last: {} })),
+      '/dsh-restart/api/precheck': response,
+    })
+    const dialog = mountDialog(document, { fetchImpl })
+    dialog.open()
+    await waitFor(() => precheckButton().disabled === false)
+    precheckButton().click()
+
+    await waitFor(() => precheckButton().disabled === false && restartButton().disabled === false)
+    expect(textOf('[data-dsh-restart-stage="boot"]')).toContain('通过')
   })
 })

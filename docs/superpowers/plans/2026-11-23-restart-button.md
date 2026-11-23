@@ -147,6 +147,7 @@
 - [x] **Step 4: 跑测试，确认通过**（`pnpm vitest run test/inject.test.ts` 14 passed）。
 - [x] **Step 5: 实现弹窗**：原生 DOM，按设计稿五段（端口 / 健康 / 模拟检查 / 重启 / 上次结果）；流式读 NDJSON 更新阶段文案（`TextDecoder` 按行缓冲，不整包等）；未通过时按钮 `disabled`，下方小字「我知道风险，直接重启」触发 `confirm()`；重启后每 2s 轮询 `status`，90s 超时转红；样式只注入一次（`ensureDialogStyle`），全部走 `--dsw-alias-*` token 并带中性色回退。
 - [x] **Step 6: Commit** `feat: 菜单入口与重启弹窗`
+- [x] **Step 7: 复审修复（C1/M1/M2/m1）**：门禁改三态（`roundRan ? localPassed : payloadPassed`，本轮开始即清掉上一次结论）；每个请求挂 `AbortController`，`close()` 统一 abort + 递增 token，`readNdjson` 在 abort 时 `reader.cancel()`；轮询加 `sawDownOrLocked`（先见 `restarting` 或连不上才认新进程），超时恢复按钮；`readNdjson` 先 drain 再判 `done`，尾块不再丢行。测试补 5 例（19 passed），并对旧实现验过 RED。
 
 ### Task 8: 装进 web profile
 
