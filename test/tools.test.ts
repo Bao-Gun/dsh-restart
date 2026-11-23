@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { apply } from '../src/index'
 import type { RouteContext } from '../src/index'
@@ -67,7 +67,9 @@ interface FakeCtx {
  * 假宿主上下文：tools 注册表把定义收进 defs/live。
  * Proxy 模拟 cordis 的注入规则——访问 ctx.tools 属性直接抛，确保实现只走 ctx.get('tools')。
  */
-function fakeCtx(options: { tools?: unknown; omitTools?: boolean; profile?: unknown } = {}): FakeCtx {
+function fakeCtx(
+  options: { tools?: unknown; omitTools?: boolean; profile?: unknown; webServer?: unknown } = {},
+): FakeCtx {
   const defs: ToolDefinitionLike[] = []
   const live: ToolDefinitionLike[] = []
   const labels: string[] = []
@@ -85,6 +87,7 @@ function fakeCtx(options: { tools?: unknown; omitTools?: boolean; profile?: unkn
   const services: Record<string, unknown> = {}
   if (options.omitTools !== true) services.tools = options.tools ?? registry
   if (options.profile !== undefined) services.profileContext = options.profile
+  if (options.webServer !== undefined) services.webServer = options.webServer
   const target = {
     effect(callback: () => void | (() => void), label?: string) {
       labels.push(label ?? '')
@@ -120,6 +123,7 @@ function jsonProblems(value: unknown, path = 'value'): string[] {
 }
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.restoreAllMocks()
   // 互斥是模块级的；用例之间别把锁漏给别人。
   releasePrecheck()
@@ -286,8 +290,22 @@ describe('registerTools', () => {
     const precheckDefinition = fake.defs.find((definition) => definition.name === 'dsh_restart_precheck') as ToolDefinitionLike
     const restartDefinition = fake.defs.find((definition) => definition.name === 'dsh_restart') as ToolDefinitionLike
 
-    // 重启工具本轮不动：仍然只回一行 summary。
+    // 重启工具与预检工具同一套渲染：summary 首块，failures/warnings 逐行附上。
     expect(restartDefinition.output.render({}, { summary: '测试摘要' })).toEqual([{ type: 'text', text: '测试摘要' }])
+    const restartBlocks = restartDefinition.output.render(
+      {},
+      {
+        summary: '重启没成',
+        failures: [{ kind: 'boot', message: '试跑实例没起来', plugin: 'dsh-broken' }],
+        warnings: [{ kind: 'compat', message: '版本不符' }],
+      },
+    )
+    expect(restartBlocks[0]).toEqual({ type: 'text', text: '重启没成' })
+    expect(restartBlocks).toHaveLength(3)
+    expect(restartBlocks[1]?.text).toContain('失败：')
+    expect(restartBlocks[1]?.text).toContain('试跑实例没起来')
+    expect(restartBlocks[2]?.text).toContain('提示：')
+    expect(restartBlocks[2]?.text).toContain('版本不符')
 
     const blocks = precheckDefinition.output.render(
       {},
@@ -475,4 +493,272 @@ describe('dsh_restart_precheck', () => {
     expect(jsonProblems(value)).toEqual([])
   })
 })
+describe('dsh_restart', () => {
+  /** 重启工具的输出契约（Task 5 brief 的 8 个字段，一个不多一个不少）。 */
+  interface RestartValue {
+    ok: boolean
+    restarted: boolean
+    reason: string
+    port: number
+    profileName: string
+    failures: Failure[]
+    warnings: Failure[]
+    summary: string
+  }
+
+  /** 与 fakeIo 默认指纹一致的「上次预检通过」记录。 */
+  const PASSED: NonNullable<LastRecord['precheck']> = {
+    at: '2026-11-23T11:59:00.000Z',
+    ok: true,
+    fingerprint: '0123456789abcdef',
+    failures: [],
+    durationMs: 1,
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  /** 取出重启工具定义；默认给 profileContext 与 webServer.port。 */
+  function restartOf(io: ToolIo, options: { profile?: unknown; webServer?: unknown } = {}): ToolDefinitionLike {
+    const fake = fakeCtx({
+      profile: options.profile === undefined ? PROFILE : options.profile,
+      webServer: options.webServer === undefined ? { port: 3080 } : options.webServer,
+    })
+    registerTools(fake.ctx, io)
+    const definition = fake.defs.find((item) => item.name === 'dsh_restart')
+    if (definition === undefined) throw new Error('dsh_restart 没有注册')
+    return definition
+  }
+
+  async function runRestart(
+    io: ToolIo,
+    options: { force?: boolean; profile?: unknown; webServer?: unknown } = {},
+    exec: { signal?: AbortSignal; concludeTurn?(): void } = {},
+  ): Promise<RestartValue> {
+    const { force, ...ctxOptions } = options
+    return (await restartOf(io, ctxOptions).execute({ force }, exec)) as RestartValue
+  }
+
+  it('上次预检新鲜且通过时跳过预检，2.5s 后才派生 helper 并 concludeTurn 一次', async () => {
+    const scheduled: ScheduleRestartOptions[] = []
+    let smoked = 0
+    let concluded = 0
+    const value = await runRestart(
+      fakeIo({
+        readLast: async () => ({ fingerprint: '0123456789abcdef', precheck: PASSED }),
+        runSmoke: async () => {
+          smoked += 1
+          return { ok: true, health: true, failures: [], failedEntries: [], durationMs: 1 }
+        },
+        scheduleRestart: (options) => {
+          scheduled.push(options)
+        },
+      }),
+      {},
+      {
+        concludeTurn: () => {
+          concluded += 1
+        },
+      },
+    )
+
+    expect(value).toMatchObject({ ok: true, restarted: true, reason: 'restarting', port: 3080, profileName: 'web' })
+    expect(value.failures).toEqual([])
+    expect(value.warnings).toEqual([])
+    expect(value.summary).toContain('重启')
+    expect(smoked).toBe(0)
+    expect(concluded).toBe(1)
+    expect(scheduled).toHaveLength(0)
+    vi.advanceTimersByTime(2499)
+    expect(scheduled).toHaveLength(0)
+    vi.advanceTimersByTime(1)
+    expect(scheduled).toHaveLength(1)
+    expect(scheduled[0]).toMatchObject({
+      port: 3080,
+      profileDir: PROFILE.dir,
+      dshHome: PROFILE.home,
+      profileName: PROFILE.name,
+      logDir: '/tmp/dsh-restart-test/log',
+    })
+    expect(jsonProblems(value)).toEqual([])
+  })
+
+  it('指纹变了就重跑预检，绿了才重启', async () => {
+    const scheduled: ScheduleRestartOptions[] = []
+    let smoked = 0
+    const value = await runRestart(
+      fakeIo({
+        readLast: async () => ({ fingerprint: 'ffffffffffffffff', precheck: PASSED }),
+        runSmoke: async () => {
+          smoked += 1
+          return { ok: true, health: true, failures: [], failedEntries: [], durationMs: 1 }
+        },
+        scheduleRestart: (options) => {
+          scheduled.push(options)
+        },
+      }),
+    )
+
+    expect(smoked).toBe(1)
+    expect(value).toMatchObject({ ok: true, restarted: true, reason: 'restarting' })
+    vi.advanceTimersByTime(2500)
+    expect(scheduled).toHaveLength(1)
+    expect(jsonProblems(value)).toEqual([])
+  })
+
+  it('判红且 force=false：restarted:false，不派生、不 concludeTurn，锁还回去', async () => {
+    const scheduled: ScheduleRestartOptions[] = []
+    const failures: Failure[] = [{ kind: 'boot', message: '试跑实例没起来', plugin: 'dsh-broken' }]
+    let concluded = 0
+    const value = await runRestart(
+      fakeIo({
+        runSmoke: async () => ({ ok: false, health: false, failures, failedEntries: [], durationMs: 1 }),
+        scheduleRestart: (options) => {
+          scheduled.push(options)
+        },
+      }),
+      {},
+      {
+        concludeTurn: () => {
+          concluded += 1
+        },
+      },
+    )
+
+    expect(value).toMatchObject({ ok: false, restarted: false, reason: 'precheck-failed', port: 3080, profileName: 'web' })
+    expect(value.failures).toEqual(failures)
+    expect(value.summary).toContain('检查没通过：试跑实例没起来')
+    expect(concluded).toBe(0)
+    vi.advanceTimersByTime(5000)
+    expect(scheduled).toHaveLength(0)
+    // 判红不能漏锁：下一轮预检还能拿到。
+    expect(acquirePrecheck()).toBe(true)
+    releasePrecheck()
+    expect(jsonProblems(value)).toEqual([])
+  })
+
+  it('force=true 时不跑预检直接重启', async () => {
+    const scheduled: ScheduleRestartOptions[] = []
+    let smoked = 0
+    let concluded = 0
+    const value = await runRestart(
+      fakeIo({
+        runSmoke: async () => {
+          smoked += 1
+          return { ok: true, health: true, failures: [], failedEntries: [], durationMs: 1 }
+        },
+        scheduleRestart: (options) => {
+          scheduled.push(options)
+        },
+      }),
+      { force: true },
+      {
+        concludeTurn: () => {
+          concluded += 1
+        },
+      },
+    )
+
+    expect(value).toMatchObject({ ok: true, restarted: true, reason: 'restarting' })
+    expect(smoked).toBe(0)
+    expect(concluded).toBe(1)
+    vi.advanceTimersByTime(2500)
+    expect(scheduled).toHaveLength(1)
+    expect(jsonProblems(value)).toEqual([])
+  })
+
+  it('端口未知时 reason no-port、port 0，且不跑预检不派生', async () => {
+    const scheduled: ScheduleRestartOptions[] = []
+    let smoked = 0
+    const value = await runRestart(
+      fakeIo({
+        runSmoke: async () => {
+          smoked += 1
+          return { ok: true, health: true, failures: [], failedEntries: [], durationMs: 1 }
+        },
+        scheduleRestart: (options) => {
+          scheduled.push(options)
+        },
+      }),
+      { webServer: null },
+    )
+
+    expect(value).toMatchObject({ ok: false, restarted: false, reason: 'no-port', port: 0, profileName: 'web' })
+    expect(value.summary).toContain('端口')
+    expect(smoked).toBe(0)
+    vi.advanceTimersByTime(5000)
+    expect(scheduled).toHaveLength(0)
+    expect(jsonProblems(value)).toEqual([])
+  })
+
+  it('已有重启在进行时 reason busy，不跑预检不派生', async () => {
+    const scheduled: ScheduleRestartOptions[] = []
+    let smoked = 0
+    const value = await runRestart(
+      fakeIo({
+        isRefused: async () => true,
+        runSmoke: async () => {
+          smoked += 1
+          return { ok: true, health: true, failures: [], failedEntries: [], durationMs: 1 }
+        },
+        scheduleRestart: (options) => {
+          scheduled.push(options)
+        },
+      }),
+    )
+
+    expect(value).toMatchObject({ ok: false, restarted: false, reason: 'busy', port: 3080, profileName: 'web' })
+    expect(value.summary).toContain('等它结束')
+    expect(smoked).toBe(0)
+    vi.advanceTimersByTime(5000)
+    expect(scheduled).toHaveLength(0)
+    expect(jsonProblems(value)).toEqual([])
+  })
+
+  it('没有 profileContext 时 reason no-profile、profileName 空串', async () => {
+    let smoked = 0
+    const value = await runRestart(
+      fakeIo({
+        runSmoke: async () => {
+          smoked += 1
+          return { ok: true, health: true, failures: [], failedEntries: [], durationMs: 1 }
+        },
+      }),
+      { profile: null },
+    )
+
+    expect(value).toMatchObject({ ok: false, restarted: false, reason: 'no-profile', profileName: '' })
+    expect(value.summary).toContain('profileContext')
+    expect(smoked).toBe(0)
+    expect(jsonProblems(value)).toEqual([])
+  })
+
+  it('信号已取消时 reason cancelled，不抢锁不派生', async () => {
+    const scheduled: ScheduleRestartOptions[] = []
+    let smoked = 0
+    const controller = new AbortController()
+    controller.abort()
+    const value = await runRestart(
+      fakeIo({
+        runSmoke: async () => {
+          smoked += 1
+          return { ok: true, health: true, failures: [], failedEntries: [], durationMs: 1 }
+        },
+        scheduleRestart: (options) => {
+          scheduled.push(options)
+        },
+      }),
+      {},
+      { signal: controller.signal },
+    )
+
+    expect(value).toMatchObject({ ok: false, restarted: false, reason: 'cancelled', port: 3080 })
+    expect(smoked).toBe(0)
+    vi.advanceTimersByTime(5000)
+    expect(scheduled).toHaveLength(0)
+    expect(jsonProblems(value)).toEqual([])
+  })
+})
+
 
