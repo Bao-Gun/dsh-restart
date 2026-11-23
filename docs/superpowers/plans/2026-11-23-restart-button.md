@@ -72,13 +72,13 @@
 
 **Interfaces:**
 - Consumes: `parseRuntime`（Task 1）；宿主 `evaluatePluginCompatibility` / `getDshRuntimeVersion`（`@deepseek-ai/dsh-app-boot`）。
-- Produces: `readInstalled(profileDir: string): Promise<InstalledPlugin[]>`（`{ id, name, version, enginesDsh?: string, peerDsh?: string }`）；`compatFailures(plugins: InstalledPlugin[], runtimeVersion: string): Failure[]`。
+- Produces: `readInstalled(profileDir: string, options?: { onWarning?: (f: Failure) => void }): Promise<InstalledPlugin[]>`（`{ id, name, version, enginesDsh?: string, peerDsh?: string, peerDependencies?: Record<string, string> }`；最后一个是完整的 dsh-* peer 集合，只留 `peerDsh` 会漏判 `@deepseek-ai/dsh-tools` 这类 peer）；`compatFailures(plugins: InstalledPlugin[], runtimeVersion: string): Failure[]`；`hostCompatibility()`（取宿主那两个函数，失败返回 `null`）、`hostRuntimeVersion(): string`（失败返回空串）。
 
-- [ ] **Step 1: 写失败测试**：`enginesDsh='>=0.3.0'` 配 `'0.2.2-rc.5'` 产出一条 `{kind:'compat', plugin:'x'}` 且 `expected==='>=0.3.0'`；`'*'` 与缺省（有 dsh peer 依赖）各产出 0 条与按 peer 判定的一条。
-- [ ] **Step 2: 跑测试，确认失败。**
-- [ ] **Step 3: 实现**，判定一律调用宿主的 `evaluatePluginCompatibility`，不自己写版本比较。
-- [ ] **Step 4: 跑测试，确认通过。**
-- [ ] **Step 5: Commit** `feat: 兼容性快检`
+- [x] **Step 1: 写失败测试**：`enginesDsh='>=0.3.0'` 配 `'0.2.2-rc.5'` 产出一条 `{kind:'compat', plugin:'x'}` 且 `expected==='>=0.3.0'`；`'*'` 与缺省（有 dsh peer 依赖）各产出 0 条与按 peer 判定的一条。另覆盖：空/非法运行时版本明确失败（不是 0 条）、坏清单只影响自己那一条、`readInstalled` 的 fixture（依赖 + 只挂 patch 的条目 + patch 里的模型行）。
+- [x] **Step 2: 跑测试，确认失败。**
+- [x] **Step 3: 实现**，判定一律调用宿主的 `evaluatePluginCompatibility`，不自己写版本比较。宿主包不静态 import 也不打包（profile 的 node_modules 里没有它，打包又会让 `getDshRuntimeVersion` 读回本插件的 version），改为按运行时入口定位 dsh 安装根、从那里 `createRequire`；定位/加载失败或版本非法都判失败，绝不默认放行。
+- [x] **Step 4: 跑测试，确认通过。**
+- [x] **Step 5: Commit** `feat: 兼容性快检`
 
 ### Task 4: 配置合成、冒烟与基线差分
 

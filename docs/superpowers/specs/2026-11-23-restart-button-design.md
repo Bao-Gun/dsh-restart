@@ -1,6 +1,6 @@
 # 重启按钮（侧栏「更多」倒数第二行）设计
 
-日期：2026-11-23 · 项目：dsh-restart · 状态：实现中（Task 2 已落 last.json 读写与 profile 指纹）
+日期：2026-11-23 · 项目：dsh-restart · 状态：实现中（Task 3 已落兼容性快检：宿主判定 + fail-closed）
 
 ## 现在是什么情况
 
@@ -18,7 +18,7 @@
 |---|---|
 | `src/index.ts` | 插件入口。向 `ctx.webServer.register({kind:'exact', path})` 挂三条 `kind:'exact'` 路由（`/dsh-restart/api/status`、`/dsh-restart/api/precheck`、`/dsh-restart/api/restart`）；组装下面几个模块 |
 | `src/server/last.ts` | 当前端口、探 `/health`、读写 `~/.dsh/dsh-restart/last.json`、算 profile 指纹 |
-| `src/server/compat.ts` | 快检 A/B：跑 `dsh --profile web --dump-config`；兼容性判定用宿主 `@deepseek-ai/dsh-app-boot` 的 `evaluatePluginCompatibility` / `getDshRuntimeVersion`，不自己写版本比较；但**该包必须 external（不内联），运行时从 dsh 安装根解析**，否则 `getDshRuntimeVersion()` 会读回本插件自己的 version；解析不到时快检判失败（fail-closed），不静默通过 |
+| `src/server/compat.ts` | 快检 A/B：跑 `dsh --profile web --dump-config`；兼容性判定用宿主 `@deepseek-ai/dsh-app-boot` 的 `evaluatePluginCompatibility` / `getDshRuntimeVersion`，不自己写版本比较；该包**既不能静态 import（profile 的 node_modules 里没有官方包）也不能打包**，运行时按入口定位 dsh 安装根、从那里的 `node_modules` 里 `createRequire`；打包会让 `getDshRuntimeVersion()` 读回本插件自己的 version；定位或解析不到时快检判失败（fail-closed），不静默通过 |
 | `src/server/smoke.ts` | 冒烟：APFS 克隆当前 profile → 临时 DSH_HOME，另起 `dsh web --port 0 --no-open`，等 `/health`，收 stderr 里的 `did not activate` 名单，杀进程、删目录 |
 | `src/server/restart.ts` | 重启：先回 202，再 fork 一个脱离的 helper；helper 自己先试 `dsh-daemon restart`，端口没回来就自拉起 |
 | `src/client/inject.ts` | 往「更多」弹层倒数第二行插入 menuitem + MutationObserver 补挂；锚点找不到时退到账号菜单旁 `[data-slot="settings.launcher"]` 上方插同款行 |
