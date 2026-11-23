@@ -31,5 +31,6 @@
 
 
 - 弹窗里两颗按钮（「开始检查」+「重启」）→ 用户想重启得先点检查、再点重启，多一步；更糟的是勾选框当时只在「本轮判红」时才出现，等于「想强制重启，必须先失败一次」 → 收敛成一颗「重启」：点它默认就是先预检后重启，勾上「跳过检查」等价于旧的强制重启（`src/client/dialog.ts`）。预检按钮删掉后，「上次通过」不能当本轮通过，指纹过期照样重跑（`src/client/dialog.ts` 的 `renderStatus`）。
+- 改成从索引按 bundle 装之后，`pnpm add <git spec>` 只写进 `dependencies`，宿主不会自动登记进 `dsh.profile.bundles`（插件的 reconcile 只管「新增」依赖，已在 dependencies 里的包它不管）→ 装完 stderr 一句 `1 entry did not activate`、按钮静默消失 → 装完手动把包名加进 `dsh.profile.bundles`；同时把 profile `cordis.patch.yml` 里手写的 `restart-button` insert 删掉——bundle 自带的 patch 已经插过一次，两处都在就会插两次。因此上一条「实在不行删 patch 里的 insert 块」在 bundle 装法下要改成摘 `dsh.profile.bundles`（README「万一没回来」已按这个写）。
 - 「上次结果」直接 `at.slice(0,16)` 切 UTC ISO 字符串 → UTC+8 机器上显示的时间永远少 8 小时（真机显示 14:26，实际 22:26） → `at` 是服务端 `toISOString()` 落的 UTC，必须 `new Date(at)` 后按本机时区的 `getFullYear/getHours` 拼字符串（`src/client/dialog.ts` 的 `formatTime`）。
 
