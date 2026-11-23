@@ -1,6 +1,6 @@
 # 重启按钮（侧栏「更多」倒数第二行）设计
 
-日期：2026-11-23 · 项目：dsh-restart · 状态：待确认（已过 builder check）
+日期：2026-11-23 · 项目：dsh-restart · 状态：实现中（Task 2 已落 last.json 读写与 profile 指纹）
 
 ## 现在是什么情况
 

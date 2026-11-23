@@ -55,14 +55,14 @@
 - Test: `test/last.test.ts`
 
 **Interfaces:**
-- Produces: `computeFingerprint(profileDir: string, dshVersion: string): Promise<string>`（sha256，含 `pnpm-lock.yaml` 内容与 dsh 版本，取前 16 位）；`readLast(dir: string): Promise<LastRecord>`；`writeLast(dir: string, patch: Partial<LastRecord>): Promise<void>`；`isStale(rec: LastRecord, fingerprint: string): boolean`。
-- Types: `LastRecord { fingerprint?: string; baseline?: string[]; precheck?: PrecheckResult; restart?: RestartRecord }`（`baseline` 是上一次**通过**时试跑出来的未激活名单，Task 6 拿它做差分）、`PrecheckResult { at: string; ok: boolean; fingerprint: string; failures: Failure[]; durationMs: number }`、`Failure { plugin?: string; kind: 'config' 'compat' 'boot'; message: string; expected?: string; actual?: string }`。
+- Produces: `computeFingerprint(profileDir: string, dshVersion: string | null): Promise<string | null>`（sha256，含 `pnpm-lock.yaml` 内容与 dsh 版本，取前 16 位；lock 读不到或版本取不到时返回 null，不抛）；`readLast(dir: string): Promise<LastRecord>`；`writeLast(dir: string, patch: Partial<LastRecord>): Promise<void>`；`isStale(rec: LastRecord, fingerprint: string | null): boolean`（当前指纹为 null 也算过期）。
+- Types: `LastRecord { fingerprint?: string; baseline?: string[]; precheck?: PrecheckResult; restart?: RestartRecord }`（`baseline` 是上一次**通过**时试跑出来的未激活名单，Task 6 拿它做差分）、`PrecheckResult { at: string; ok: boolean; fingerprint: string; failures: Failure[]; durationMs: number }`、`Failure { plugin?: string; kind: 'config' 'compat' 'boot'; message: string; expected?: string; actual?: string }`、`RestartRecord { at: string; port: number }`。
 
-- [ ] **Step 1: 写失败测试**：`isStale({fingerprint:'a'},'b')` 为 `true`；`isStale({}, 'b')` 为 `true`；`readLast` 读一个只写了半截 `{` 的文件返回 `{}` 不抛；`writeLast` 后 `readLast` 能读回。
-- [ ] **Step 2: 跑测试，确认失败。**
-- [ ] **Step 3: 实现三个函数**，写盘走 `.tmp` + `rename`，`readLast` 用 try/catch 吞掉 JSON 解析错误。
-- [ ] **Step 4: 跑测试，确认通过。**
-- [ ] **Step 5: Commit** `feat: 上次结果与 profile 指纹`
+- [x] **Step 1: 写失败测试**：`isStale({fingerprint:'a'},'b')` 为 `true`；`isStale({}, 'b')` 为 `true`；`readLast` 读一个只写了半截 `{` 的文件返回 `{}` 不抛；`writeLast` 后 `readLast` 能读回。
+- [x] **Step 2: 跑测试，确认失败。**
+- [x] **Step 3: 实现三个函数**，写盘走 `.tmp` + `rename`，`readLast` 用 try/catch 吞掉 JSON 解析错误。
+- [x] **Step 4: 跑测试，确认通过。**
+- [x] **Step 5: Commit** `feat: 指纹与 last.json`
 
 ### Task 3: 兼容性快检
 
