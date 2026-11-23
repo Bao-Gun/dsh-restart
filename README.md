@@ -5,7 +5,8 @@
 ## 跑起来
 
 ```bash
-# ⚠️ 待补全：安装 / 启动命令 —— 要补成两条能直接粘贴执行的命令（例：`npm install` / `npm run dev`）；补在：本代码块，删掉这行注释
+pnpm install && pnpm build
+node scripts/install.mjs          # dry-run；确认后加 --apply，再重启 dsh web 生效
 ```
 
 ## 检查
