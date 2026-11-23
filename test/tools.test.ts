@@ -5,6 +5,7 @@ import type { RouteContext } from '../src/index'
 import { profileOf } from '../src/server/profile'
 import { registerTools, toolsOf } from '../src/tools/index'
 import type { ToolDefinitionLike, ToolIo } from '../src/tools/index'
+import { endRestart, tryBeginRestart } from '../src/server/issue'
 import { acquirePrecheck, releasePrecheck } from '../src/server/precheck'
 import type { PrecheckIo } from '../src/server/precheck'
 import type { ScheduleRestartOptions } from '../src/server/restart'
@@ -125,8 +126,9 @@ function jsonProblems(value: unknown, path = 'value'): string[] {
 afterEach(() => {
   vi.useRealTimers()
   vi.restoreAllMocks()
-  // 互斥是模块级的；用例之间别把锁漏给别人。
+  // 互斥是模块级的；用例之间别把锁漏给别人（两把锁都要还）。
   releasePrecheck()
+  endRestart()
 })
 
 describe('profileOf', () => {
@@ -221,6 +223,22 @@ describe('registerTools', () => {
     expect(fake.disposers).toHaveLength(2)
     fake.disposers[0]?.()
     expect(fake.live.map((definition) => definition.name)).toEqual(['dsh_restart'])
+  })
+
+  it('注册表是类实例时 register 的 this 仍是该实例（toolsOf 的 bind 不能删）', () => {
+    class Registry {
+      readonly names: string[] = []
+
+      register(definition: ToolDefinitionLike): () => void {
+        if (!(this instanceof Registry)) throw new Error('register 的 this 丢了')
+        this.names.push(definition.name)
+        return () => {}
+      }
+    }
+
+    const registry = new Registry()
+    expect(registerTools(fakeCtx({ tools: registry }).ctx, fakeIo())).toBe(2)
+    expect(registry.names).toEqual(['dsh_restart_precheck', 'dsh_restart'])
   })
 
   it('没有 tools 服务时不抛，返回 0 并只打一条日志', () => {
@@ -586,6 +604,40 @@ describe('dsh_restart', () => {
     expect(jsonProblems(value)).toEqual([])
   })
 
+  it('先排重启定时器、后 concludeTurn（顺序反了结果可能没落盘）', async () => {
+    const scheduled: ScheduleRestartOptions[] = []
+    const order: string[] = []
+    const fakeSetTimeout = globalThis.setTimeout
+    const spy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, ms?: number) => {
+      if (ms === 2500) order.push('issueRestartLater')
+      return fakeSetTimeout(callback, ms)
+    }) as typeof setTimeout)
+    try {
+      const value = await runRestart(
+        fakeIo({
+          readLast: async () => ({ fingerprint: '0123456789abcdef', precheck: PASSED }),
+          scheduleRestart: (options) => {
+            scheduled.push(options)
+          },
+        }),
+        {},
+        {
+          concludeTurn: () => {
+            order.push('concludeTurn')
+          },
+        },
+      )
+
+      expect(value).toMatchObject({ ok: true, restarted: true, reason: 'restarting' })
+      // issueRestartLater 必须先在 concludeTurn 之前把定时器排上。
+      expect(order).toEqual(['issueRestartLater', 'concludeTurn'])
+      vi.advanceTimersByTime(2500)
+      expect(scheduled).toHaveLength(1)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
   it('指纹变了就重跑预检，绿了才重启', async () => {
     const scheduled: ScheduleRestartOptions[] = []
     let smoked = 0
@@ -765,6 +817,81 @@ describe('dsh_restart', () => {
     expect(smoked).toBe(0)
     vi.advanceTimersByTime(5000)
     expect(scheduled).toHaveLength(0)
+    expect(jsonProblems(value)).toEqual([])
+  })
+
+  it('另一轮预检拿着锁时 reason precheck-busy，不派生不 conclude，两把锁都不漏', async () => {
+    const scheduled: ScheduleRestartOptions[] = []
+    let smoked = 0
+    let concluded = 0
+    releasePrecheck()
+    expect(acquirePrecheck()).toBe(true)
+
+    const value = await runRestart(
+      fakeIo({
+        runSmoke: async () => {
+          smoked += 1
+          return { ok: true, health: true, failures: [], failedEntries: [], durationMs: 1 }
+        },
+        scheduleRestart: (options) => {
+          scheduled.push(options)
+        },
+      }),
+      {},
+      {
+        concludeTurn: () => {
+          concluded += 1
+        },
+      },
+    )
+
+    expect(value).toMatchObject({ ok: false, restarted: false, reason: 'precheck-busy', port: 3080, profileName: 'web' })
+    expect(value.summary).toContain('另一个预检')
+    expect(smoked).toBe(0)
+    expect(concluded).toBe(0)
+    vi.advanceTimersByTime(5000)
+    expect(scheduled).toHaveLength(0)
+    // 锁在别人手里，工具不能替别人放。
+    expect(acquirePrecheck()).toBe(false)
+    // 重启锁必须已还，否则后续重启会永久 busy。
+    expect(tryBeginRestart()).toBe(true)
+    endRestart()
+    expect(jsonProblems(value)).toEqual([])
+  })
+
+  it('检查阶段抛错时 reason error，不派生不 conclude，重启锁还回去', async () => {
+    const scheduled: ScheduleRestartOptions[] = []
+    let smoked = 0
+    let concluded = 0
+    const value = await runRestart(
+      fakeIo({
+        readLast: async () => {
+          throw new Error('disk on fire')
+        },
+        runSmoke: async () => {
+          smoked += 1
+          return { ok: true, health: true, failures: [], failedEntries: [], durationMs: 1 }
+        },
+        scheduleRestart: (options) => {
+          scheduled.push(options)
+        },
+      }),
+      {},
+      {
+        concludeTurn: () => {
+          concluded += 1
+        },
+      },
+    )
+
+    expect(value).toMatchObject({ ok: false, restarted: false, reason: 'error', port: 3080, profileName: 'web' })
+    expect(value.summary).toContain('disk on fire')
+    expect(smoked).toBe(0)
+    expect(concluded).toBe(0)
+    vi.advanceTimersByTime(5000)
+    expect(scheduled).toHaveLength(0)
+    expect(tryBeginRestart()).toBe(true)
+    endRestart()
     expect(jsonProblems(value)).toEqual([])
   })
 

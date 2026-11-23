@@ -6,7 +6,7 @@
 
 | 模块 | 路径 | 职责 | 谁调用它 |
 |---|---|---|---|
-| 插件入口 | `src/index.ts` | 导出 `name` / `inject`，在 `apply(ctx)` 里向 `ctx.webServer.register` 挂三条 exact 路由（status / precheck / restart）；请求门（方法 + `x-dsh-restart: 1` + Origin 与 Host 一致）；precheck 用 NDJSON 逐行推三段；restart 回 202 后在 `finish` / `close` 事件里派生 helper；`precheckRunning` / `restartStarting` 进程内互斥 | 宿主插件加载器调 `apply`；浏览器弹窗发 HTTP 进来 |
+| 插件入口 | `src/index.ts` | 导出 `name` / `inject`，在 `apply(ctx)` 里向 `ctx.webServer.register` 挂三条 exact 路由（status / precheck / restart）；请求门（方法 + `x-dsh-restart: 1` + Origin 与 Host 一致）；precheck 用 NDJSON 逐行推三段；restart 回 202 后在 `finish` / `close` 事件里派生 helper；进程内互斥不在这里：预检锁在 `src/server/precheck.ts`，重启锁在 `src/server/issue.ts` | 宿主插件加载器调 `apply`；浏览器弹窗发 HTTP 进来 |
 | 预检核心 | `src/server/precheck.ts` | 三段预检（config → compat → boot）、基线差分、`last.json` 落盘、取消语义；`acquirePrecheck` / `releasePrecheck` 是进程级互斥（路由与工具共用一把锁） | `src/index.ts` 的 precheck 路由、`src/tools/precheck.ts`、`src/tools/restart.ts` |
 | 重启核心 | `src/server/issue.ts` | `restartGuards`（profile → 端口 → restart.lock 三项守卫）、`armRestart` 立刻派生、`issueRestartLater` 延迟派生（返回取消函数）、`tryBeginRestart` / `endRestart` 进程互斥；不感知 HTTP | `src/index.ts` 的 restart 路由、`src/tools/restart.ts` |
 | profile 识别 | `src/server/profile.ts` | 只认 `ctx.get('profileContext')`，归一成 `{ dir, name, home }`（name / home 缺省从目录推）；取不到返回 undefined，由调用方 fail-closed | 三条路由与两个工具 |
