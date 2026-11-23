@@ -18,7 +18,9 @@ import { computeFingerprint, isStale, readLast, writeLast } from './server/last'
 import { compatFailures, hostRuntimeVersion, readInstalled } from './server/compat'
 import { runDumpConfig, runSmoke } from './server/smoke'
 import { acquirePrecheck, releasePrecheck, runPrecheckRun } from './server/precheck'
-import type { PrecheckIo, PrecheckOutcome } from './server/precheck'
+import type { PrecheckIo, PrecheckOutcome, PrecheckTarget } from './server/precheck'
+import { RESTART_BUSY_ERROR, armRestart, endRestart, restartGuards, tryBeginRestart } from './server/issue'
+import type { RestartIssueIo } from './server/issue'
 import {
   PLUGIN_STATUS_PATH,
   RESTART_LOCK_NAME,
@@ -26,7 +28,6 @@ import {
   scheduleRestart,
   waitForPort,
 } from './server/restart'
-import type { ScheduleRestartOptions } from './server/restart'
 
 export const name = 'dsh-restart'
 
@@ -60,11 +61,9 @@ export interface RouteContext {
   get(service: string): unknown
 }
 
-/** 路由用到的全部 IO / 时钟；预检那部分与核心模块共用同一份契约。 */
-export interface RouteIo extends PrecheckIo {
+/** 路由用到的全部 IO / 时钟；预检/重启那部分与核心模块共用同一份契约。 */
+export interface RouteIo extends PrecheckIo, RestartIssueIo {
   probeHealth(port: number): Promise<boolean>
-  scheduleRestart(options: ScheduleRestartOptions): void
-  isRefused(lockPath: string): Promise<boolean>
 }
 
 export interface Handlers {
@@ -135,9 +134,8 @@ export function apply(ctx: RouteContext): void {
 
 export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = {}): Handlers {
   const io = withOverrides(defaultIo(), overrides)
-  // 预检的进程内互斥已搬进 core（acquirePrecheck / releasePrecheck），路由与工具共用那一把锁。
-  // 进程内重启互斥：挡住同一进程内同时点两次；跨进程仍以 helper 的 lock 文件为准。
-  let restartStarting = false
+  // 预检/重启的进程内互斥都在各自的 core 里（acquirePrecheck / tryBeginRestart），
+  // 路由与工具共用那一把锁；跨进程仍以 helper 的 restart.lock 为准。
 
   const status: RouteHandler = async (req, res) => {
     if (!guard(ctx, req, res, 'GET', STATUS_PATH)) return
@@ -269,20 +267,13 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
 
   const restart: RouteHandler = async (req, res) => {
     if (!guard(ctx, req, res, 'POST', RESTART_PATH)) return
-    if (restartStarting) {
+    if (!tryBeginRestart()) {
       // 进程内先挡一层，别让双击产生两个 helper；跨进程的最终裁决仍看 restart.lock。
-      respondJson(res, 409, { ok: false, error: '已有一个重启在进行中，等它结束再试' })
+      respondJson(res, 409, { ok: false, error: RESTART_BUSY_ERROR })
       return
     }
-    restartStarting = true
-    let released = false
-    const release = (): void => {
-      if (released) return
-      released = true
-      restartStarting = false
-    }
     // 客户端可能在 isRefused 挂起期间就断开；先记录，等判定完再决定怎么收尾。
-    // 不能在这里 release：否则第一个请求还没派生 helper，第二个请求就能挤进来。
+    // 不能在这里 endRestart：否则第一个请求还没派生 helper，第二个请求就能挤进来。
     let clientGone = false
     res.once('close', () => {
       clientGone = true
@@ -290,28 +281,16 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
 
     try {
       const profile = profileOf(ctx)
-      if (profile === undefined) {
-        release()
-        respondJson(res, 503, { ok: false, error: '取不到 profileContext，无法重启' })
-        return
-      }
       const port = currentPort(ctx)
-      if (port === undefined) {
-        release()
-        respondJson(res, 503, { ok: false, error: 'webServer 还没监听端口，无法重启' })
+      const gate = await restartGuards(io, profile, port)
+      if (!gate.ok) {
+        endRestart()
+        respondJson(res, gate.status, { ok: false, error: gate.error })
         return
       }
-      let refused = false
-      try {
-        refused = await io.isRefused(join(io.logDir, RESTART_LOCK_NAME))
-      } catch {
-        refused = false
-      }
-      if (refused) {
-        release()
-        respondJson(res, 409, { ok: false, error: '已有一个重启在进行中，等它结束再试' })
-        return
-      }
+      // 守卫已经证明两者都在（喂进去的就是这两份值）；返回类型不带收窄，这里断言一次。
+      const target = profile as PrecheckTarget
+      const listenPort = port as number
 
       const at = io.now().toISOString()
       let armed = false
@@ -319,33 +298,27 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
         if (armed) return
         armed = true
         // 响应已落 socket 才派生 helper；不在响应前拍脑袋延迟。
-        io.scheduleRestart({
-          port,
-          profileDir: profile.dir,
-          logDir: io.logDir,
-          dshHome: profile.home,
-          profileName: profile.name,
-        })
+        armRestart(io, target, listenPort)
       }
 
       // 'finish' 正常路径；'close' 兜底客户端在 202 落盘前就断开的情况。arm 幂等。
       res.once('finish', arm)
       res.once('close', arm)
-      res.once('close', release)
+      res.once('close', endRestart)
       res.statusCode = 202
       res.setHeader('content-type', 'application/json; charset=utf-8')
       res.setHeader('cache-control', 'no-store')
       const body = JSON.stringify({
         ok: true,
         at,
-        port,
+        port: listenPort,
         logDir: io.logDir,
-        profileName: profile.name,
+        profileName: target.name,
       })
       if (clientGone) {
-        // close 早于上面的监听挂载：事件不会再触发，手动补 arm + release，别留下永久 409。
+        // close 早于上面的监听挂载：事件不会再触发，手动补 arm + endRestart，别留下永久 409。
         arm()
-        release()
+        endRestart()
         try {
           res.end(body)
         } catch {
@@ -355,7 +328,7 @@ export function createHandlers(ctx: RouteContext, overrides: Partial<RouteIo> = 
       }
       res.end(body)
     } catch (error) {
-      release()
+      endRestart()
       if (!res.headersSent) {
         respondJson(res, 500, { ok: false, error: '重启请求处理失败：' + messageOf(error) })
       } else {
