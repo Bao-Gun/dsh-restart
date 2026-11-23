@@ -46,5 +46,10 @@ else
   done
 fi
 
+# ⑤ 插件市场的前提：package.json 声明了 bundle，且 patch 文件真的在（少了它安装器报 not-a-bundle）
+if ! node -e "const p=require('./package.json');const {existsSync}=require('node:fs');process.exit(p.dsh&&p.dsh.bundle&&p.dsh.bundle.patch&&existsSync(p.dsh.bundle.patch)?0:1)"; then
+  bad "package.json 的 dsh.bundle.patch 缺失或指向不存在的文件，插件市场装不上"
+fi
+
 if [ "$fail" -eq 0 ]; then echo '✓ 全部通过'; else echo '✗ 有未通过项' >&2; fi
 exit "$fail"
