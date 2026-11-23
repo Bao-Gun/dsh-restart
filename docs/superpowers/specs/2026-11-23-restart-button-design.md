@@ -51,7 +51,7 @@
 - **两个 POST 不收无来历的请求**：先过宿主 `connection.requestRejection`（Host/Origin 与浏览器/API 凭据），再要求 `Origin` 与 `Host` 一致、且带自定义头 `X-DSH-Restart: 1`（跨站发不出来）。本机单用户也照做——将来开到 LAN 或隧道后面，这就是远程关机按钮。唯一例外是 helper 重启后的只读就绪探针：回环地址 + `GET /dsh-restart/api/status` + 带头 + 无 Origin 时，宿主的 401 被当作放行；`precheck` / `restart` 永不享受这个例外。
 - **上次结果会过期。** `last.json` 带 profile 指纹（lockfile 摘要 + dsh 版本）；对不上就显「已过期，需重新检查」，按钮回到灰禁。装完插件看到的是上一次的「通过」，正是最危险的那一刻。
 - **门禁只认本轮结果。** 一旦点了「开始检查」，上一次的「通过」立刻作废：本轮只要有任何一段红，按钮就回到 disabled，只剩「我知道风险，直接重启」。`roundRan ? localPassed : payloadPassed`——写成 `localPassed || payloadPassed` 会让「上次通过 + 本次失败」仍然可点，正是最该拦住的那条路。
-- **关掉弹窗就放弃在飞请求。** 每次请求带 `AbortController`，`close()` 统一 abort 并递增 token；服务端靠 `res.once('close')` 中止冒烟、不写 `last.json`。回包回到已关闭/已重开的弹窗前先比 token，不画进新弹窗。
+- **关掉弹窗就放弃在飞请求。** 每次请求带 `AbortController`，`close()` 统一 abort 并递增 token；服务端靠 `res.once('close')` 中止冒烟、不写 `last.json`，但已经受理的重启不会被撤回——`close` 里照常派生 helper，abort 只影响预检和本次轮询的展示。回包回到已关闭/已重开的弹窗前先比 token，不画进新弹窗。
 - **判定回来不能只看 `/health`**：插件自己的 status 也要 200；探不到就报「插件未加载」，不能显示「已重启」——用错 profile/DSH_HOME 的进程同样 200 `/health`，但侧栏里没有按钮。
 
 ## 范围

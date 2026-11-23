@@ -1,6 +1,6 @@
 # dsh-restart
 
-给自己用的 DSH 插件：给 dsh web 加一个 `dsh_restart` 工具，替代每次手动停掉再拉起 dsh web 进程（一周三次，每次约五分钟）。
+给自己用的 DSH 插件：在 dsh web 侧栏账号菜单倒数第二行加一颗「重启 dsh web」，省掉每次手停手起的五分钟。点开先跑一轮模拟启动检查（克隆 profile、起副本试跑），通过了才允许真重启——装坏的插件在重启之前就被拦下。
 
 ## 目录地图
 
@@ -24,19 +24,8 @@
 
 ## 命令
 
-- 启动：⚠️ 待补全：启动命令 —— 要补成一行能启动的命令（例：`npm run dev`）；补在：本行
-- 检查：`bash check.sh`（唯一判断对错的方式，别靠肉眼）
-
-## 现在缺什么
-
-| 缺什么 | 要补成 | 补在哪 |
-|---|---|---|
-| 安装 / 启动命令 | 两行能直接粘贴执行的命令 | 本文件「启动」那行 与 `README.md`「跑起来」代码块 |
-| 测试 / 验收命令 | 一行能跑的命令（例：`npm test`） | `check.sh` 第 ④ 段 |
-| 模块表 | 每个模块一行：路径 / 职责 / 谁调用它 | `docs/architecture.md`「模块」表 |
-| 数据流 | 一行：从哪进来 → 经过哪 → 存到哪 | `docs/architecture.md`「数据流」 |
-| 关键约束 | 一条不能违反的规则 | `docs/architecture.md`「关键约束」 |
-| 第一条坑 | 现象 → 原因 → 做法 | `docs/gotchas.md` |
+- 启动：`pnpm install && pnpm build` → `node scripts/install.mjs`（dry-run，只打印将写进 profile 的改动）→ 确认后加 `--apply` → 重启 dsh web（首次手动，之后点按钮）。可选 `node scripts/install.mjs --verify` 先在克隆副本里验证。完整步骤与确认方法见 `README.md`。
+- 检查：`bash check.sh`（唯一判断对错的方式，别靠肉眼；底层是 `pnpm test`）。
 
 ## 维护
 
