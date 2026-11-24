@@ -1,6 +1,6 @@
 #!/bin/sh
 # 一条命令判断对不对。绿 = 全部通过，红 = 有东西坏了。
-# ①②③ 是骨架自带的；④ 是测试、构建与运行期依赖断言。
+# ①②③ 是骨架自带的；④ 是测试、构建与运行期依赖断言；⑤ 是 bundle 声明；⑥ 是插件市场索引自检。
 cd "$(dirname "$0")" || exit 1
 fail=0
 bad() { printf '✗ %s\n' "$1" >&2; fail=1; }
@@ -50,6 +50,10 @@ fi
 if ! node -e "const p=require('./package.json');const {existsSync}=require('node:fs');process.exit(p.dsh&&p.dsh.bundle&&p.dsh.bundle.patch&&existsSync(p.dsh.bundle.patch)?0:1)"; then
   bad "package.json 的 dsh.bundle.patch 缺失或指向不存在的文件，插件市场装不上"
 fi
+
+# ⑥ 插件市场索引自检：索引里的 commit 必须真的有产物，且与当前提交一致。
+# 索引指向旧提交 = 装的人拿到旧代码，而市场 UI 上看起来一切正常，只能靠这里挡。
+node scripts/check-index.mjs || bad "索引自检失败（见上一段输出）"
 
 if [ "$fail" -eq 0 ]; then echo '✓ 全部通过'; else echo '✗ 有未通过项' >&2; fi
 exit "$fail"
