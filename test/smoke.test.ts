@@ -6,11 +6,16 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
 import {
+  CLONE_TIMEOUT_MS,
+  COPY_TIMEOUT_MS,
   cleanupStaleSmokeDirs,
+  cloneAttemptTimeoutMs,
+  describeCloneAttempt,
   diffFailedEntries,
   killProcessTree,
   parseNotActivated,
 } from '../src/server/smoke'
+import type { CommandOutcome } from '../src/server/smoke'
 
 /** 宿主 dsh-app-boot 的可选条目告警原文形状（activationDiagnostic）。 */
 const WARNING_STDERR = [
@@ -330,5 +335,39 @@ describe('cleanupStaleSmokeDirs', () => {
     } finally {
       await rm(root, { recursive: true, force: true })
     }
+  })
+})
+
+describe('冒烟克隆：超时预算与失败文案', () => {
+  it('只有 macOS clonefile 算快路径；reflink 在 ext4 会静默退化成整拷，只能按整拷预算', () => {
+    expect(COPY_TIMEOUT_MS).toBeGreaterThan(CLONE_TIMEOUT_MS)
+    expect(cloneAttemptTimeoutMs(['-c', '-R', 'a', 'b'])).toBe(CLONE_TIMEOUT_MS)
+    expect(cloneAttemptTimeoutMs(['--reflink=auto', '-R', 'a', 'b'])).toBe(COPY_TIMEOUT_MS)
+    expect(cloneAttemptTimeoutMs(['-R', 'a', 'b'])).toBe(COPY_TIMEOUT_MS)
+  })
+
+  it('超时单独标「克隆超时（N ms）」；非超时带自己的退出码与 stderr', () => {
+    const timedOut: CommandOutcome = {
+      code: null,
+      stdout: '',
+      stderr: '',
+      timedOut: true,
+      spawnError: null,
+    }
+    const exited: CommandOutcome = {
+      code: 1,
+      stdout: '',
+      stderr: "cp: invalid option -- 'c'",
+      timedOut: false,
+      spawnError: null,
+    }
+
+    const timeoutText = describeCloneAttempt(['--reflink=auto', '-R', 'a', 'b'], timedOut, COPY_TIMEOUT_MS)
+    expect(timeoutText).toBe('cp --reflink=auto -R：克隆超时（120000 ms）')
+    expect(timeoutText).not.toContain('退出码')
+
+    const exitText = describeCloneAttempt(['-c', '-R', 'a', 'b'], exited, CLONE_TIMEOUT_MS)
+    expect(exitText).toBe("cp -c -R：退出码 1：cp: invalid option -- 'c'")
+    expect(exitText).not.toContain('克隆超时')
   })
 })

@@ -25,8 +25,8 @@ const execFileAsync = promisify(execFile)
 /** 轮询窗口 12s；总墙钟约 13s：克隆约 5s + 启动约 5s + SIGTERM 宽限 2s + 删两万多个文件。 */
 const DEFAULT_SMOKE_TIMEOUT_MS = 12_000
 const DUMP_CONFIG_TIMEOUT_MS = 20_000
-const CLONE_TIMEOUT_MS = 60_000
-const COPY_TIMEOUT_MS = 120_000
+export const CLONE_TIMEOUT_MS = 60_000
+export const COPY_TIMEOUT_MS = 120_000
 const HEALTH_POLL_INTERVAL_MS = 150
 const KILL_GRACE_MS = 2_000
 const KILL_KILL_GRACE_MS = 1_000
@@ -82,7 +82,8 @@ export interface SmokeResult {
   durationMs: number
 }
 
-interface CommandOutcome {
+/** 子进程结果；导出只为测试能构造 describeCloneAttempt 的入参。 */
+export interface CommandOutcome {
   code: number | null
   stdout: string
   stderr: string
@@ -541,13 +542,16 @@ export async function runDumpConfig(profileDir: string): Promise<Failure[]> {
   }))
 }
 
-/** 快路径（clonefile / reflink）失败要快；兜底的普通 -R 是整拷贝，给更长的预算。 */
-function cloneAttemptTimeoutMs(args: string[]): number {
-  return args.includes('-c') || args.includes('--reflink=auto') ? CLONE_TIMEOUT_MS : COPY_TIMEOUT_MS
+/**
+ * 只有 macOS 的 clonefile（`-c`）算快路径，给 CLONE 预算；其余含 `--reflink=auto` 都按整拷给 COPY 预算。
+ * 原因：ext4 上 `--reflink=auto` 不报错、静默退化成整拷，按 CoW 给 60s 预算会把「慢拷贝」误报成超时。
+ */
+export function cloneAttemptTimeoutMs(args: string[]): number {
+  return args.includes('-c') ? CLONE_TIMEOUT_MS : COPY_TIMEOUT_MS
 }
 
 /** 报错里只带 cp 的选项（候选表最后两段固定是 source / dest），逐条列出「用了什么参数：为什么失败」。 */
-function describeCloneAttempt(args: string[], outcome: CommandOutcome, timeoutMs: number): string {
+export function describeCloneAttempt(args: string[], outcome: CommandOutcome, timeoutMs: number): string {
   const command = 'cp ' + args.slice(0, -2).join(' ')
   if (outcome.timedOut) return command + '：克隆超时（' + String(timeoutMs) + ' ms）'
   return command + '：' + describeCommand(outcome)
