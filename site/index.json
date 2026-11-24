@@ -47,15 +47,15 @@
       },
       "versions": [
         {
-          "version": "0.1.0",
-          "publishTimestamp": 1795449026,
+          "version": "0.2.0",
+          "publishTimestamp": 1795489803,
           "engines": {
             "dsh": ">=0.2.2-rc.5"
           },
           "source": {
             "type": "git",
             "url": "https://github.com/Bao-Gun/dsh-restart.git",
-            "commit": "ddff34008cc9f5f6bf630c4ef20a5c59f8829075"
+            "commit": "80a79a3c52c63d3791feaa0bd7de924c21ec5182"
           }
         }
       ]
