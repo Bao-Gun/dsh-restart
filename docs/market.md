@@ -29,10 +29,35 @@ git add site/index.json && git commit -m "chore: 更新索引" && git push
 
 推上去之后 Actions 会重跑一次生成再部署，所以第 4 步的本地提交只是为了仓库自洽，不是必需。
 
-装的人在「插件 → 发现 → 添加索引源」里贴：
+## 让聚合索引跟上（插件发版后必做）
+
+本仓的 `site/index.json` 只是**这个仓库的**索引，没有人直接添加它：装的人那边只留一条索引源——聚合索引仓 `Bao-Gun/dsh-plugins`。它也在这条链路上，但它**不会因为插件仓库发版而自己重扫**（跨仓库没有事件），触发只有三种：它自己 `site/**`、`scripts/**` 有提交，每天 03:17 的 cron，或者手动 dispatch。所以发版的最后一步是：
+
+```bash
+cd ../dsh-plugins
+node scripts/build-index.mjs      # 本地看一眼解析出的版本与 commit
+git add site/index.json && git commit -m "chore: 重扫索引" && git push
+# 或只触发 CI，不改本仓文件：gh workflow run pages -R Bao-Gun/dsh-plugins
+```
+
+部署偶发 `Found 0 artifact(s)`（upload 与 deploy 的竞态）时重跑就行，别改 workflow：
+
+```bash
+gh run list -R Bao-Gun/dsh-plugins --limit 3
+gh run rerun <run-id> --failed -R Bao-Gun/dsh-plugins
+```
+
+然后 curl 线上那份确认跟上了（别只看仓库里的文件）：
+
+```bash
+curl -s https://bao-gun.github.io/dsh-plugins/index.json | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{for(const p of JSON.parse(s).plugins)for(const v of p.versions)console.log(p.name,v.version,v.source.commit.slice(0,7))})"
+```
+
+装的人在「插件 → 发现 → 添加索引源」里贴（旧地址先删掉，两份都留着会读到重复插件）：
 
 ```
-https://<用户名>.github.io/dsh-restart/index.json
+https://bao-gun.github.io/dsh-plugins/index.json                                                  # 海外 / 能连 Pages
+https://ghproxy.net/https://raw.githubusercontent.com/Bao-Gun/dsh-plugins/main/site/index.json    # 国内（随发版即时更新）
 ```
 
 ## 硬约束（都是踩出来的）
@@ -42,7 +67,7 @@ https://<用户名>.github.io/dsh-restart/index.json
 - 反过来，别指望 `prepare` 脚本救场：pnpm 11 会拦 git 依赖的构建脚本（`ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`），多一步审批，还得在装的人机器上装一套 tsup。
 - **索引里的 commit 必须是「产物已经在仓库里」的那个提交**，所以脚本自己不提交，顺序永远是 build → commit → 生成索引。
 - **仓库得是 public**：免费账号的私有仓库开不了 Pages，而且 git 源装私有仓库要凭据，「贴个 URL 就能装」就不成立了。仓库已转 public，Pages 也在正常部署。
-- **国内机器贴 jsDelivr 镜像那条 URL。** GitHub Pages 的域名（`<用户名>.github.io`）与 `raw.githubusercontent.com` 在 NAS 上实测都不可达（DNS/污染，curl 直接空响应），`github.com` 与 `cdn.jsdelivr.net` 正常。索引 URL 换成 `https://cdn.jsdelivr.net/gh/Bao-Gun/dsh-restart@main/site/index.json` 就能装。注意 jsDelivr 对 `@main` 有缓存，部署后可能滞后十几分钟；要立刻拿到最新就写 `@<40 位 commit>`。
+- **国内机器走 ghproxy，别拿 jsDelivr 装最新版。** `<用户名>.github.io` 与 `raw.githubusercontent.com` 在 NAS 上实测都不可达（curl 空响应），而 `github.com`、`ghproxy.net` 通：`https://ghproxy.net/https://raw.githubusercontent.com/Bao-Gun/dsh-plugins/main/site/index.json` 随发版立刻更新（200、0 重定向；它回 `content-type: text/plain` 也能装，宿主只校验状态码、大小和 JSON 体）。jsDelivr（`cdn.`/`fastly.`/`gcore.` 三个域名同源缓存）能解析 `@main`，但响应头是 `max-age=604800, s-maxage=43200`，实测发版后调 `https://purge.jsdelivr.net/gh/<owner>/<repo>@main/<path>` 报 finished 仍继续吐旧版本；要钉死就写 40 位 commit，代价是不再跟新版。
 - 托管有硬性要求：UTF-8 JSON、2xx、**不许重定向**、默认不超过 128 MiB。GitHub Pages 满足；换成对象存储或自建服务时注意别加一层 `301`。
 
 ## 真机验收记录（2026-11-24，飞牛 NAS / Debian 12 / ext4 / dsh 0.2.2-rc.5）
@@ -51,7 +76,8 @@ https://<用户名>.github.io/dsh-restart/index.json
 
 | 环节 | 实测 |
 | --- | --- |
-| 添加索引源（jsDelivr 镜像）→ 列表出现「重启与预检 0.2.0」 | 正常，确认框显示 commit `80a79a3` |
+| 添加索引源（当时还是本仓单独一条 jsDelivr 地址）→ 列表出现「重启与预检 0.2.0」 | 正常，确认框显示 commit `80a79a3` |
+| 索引源换成聚合索引（ghproxy 镜像）→ 列表同时出现「重启与预检 0.2.0」和「升级 0.1.0」 | 正常；`dsh --profile web --dump-config` 里只剩这一条索引源，官方 `parseMarketIndex` 解析出 `dsh-restart@0.2.0#5ea4149` |
 | 安装（git 源，clone + 装 node_modules） | ≤20s；装完 profile `package.json` 得到 `github:Bao-Gun/dsh-restart#80a79a3…`，`node_modules/dsh-restart` 就位 |
 | 预检 | 11.4s，failures 0 / warnings 29（全是 NAS 上 patch 里那些模型条目缺 `package.json` 的提示） |
 | 重启 | helper 7.5s 回到 healthy：`port before up` → `port down (+316ms)` → 新实例拉起 → `port up (+6857ms)` |

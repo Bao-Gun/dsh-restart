@@ -53,11 +53,11 @@ node scripts/install.mjs --apply  # 真写：profile 的 package.json 依赖（l
 
 ## 走索引装
 
-仓库里带了插件市场索引源（`site/index.json`）：「插件 → 发现 → 添加索引源」贴一条 URL 就能一键装，装的是索引里固定的那个 commit（`lib/*.js` 已在仓库里，装下来直接加载、不跑构建）。适合装到别的机器上，或者哪天不想再挂本机软链时。
+索引源只有一条：聚合索引仓 `Bao-Gun/dsh-plugins`，自己的插件（本插件、`dsh-upgrade`）都列在里面。本仓的 `site/index.json` 只是它的输入，不要单独添加。「插件 → 发现 → 添加索引源」贴一条 URL 就能一键装，装的是索引里固定的那个 commit（`lib/*.js` 已在仓库里，装下来直接加载、不跑构建）。适合装到别的机器上，或者哪天不想再挂本机软链时。
 
 ```
-https://bao-gun.github.io/dsh-restart/index.json                        # GitHub Pages 原站
-https://cdn.jsdelivr.net/gh/Bao-Gun/dsh-restart@main/site/index.json    # jsDelivr 镜像（国内可达）
+https://bao-gun.github.io/dsh-plugins/index.json                                                  # GitHub Pages 原站
+https://ghproxy.net/https://raw.githubusercontent.com/Bao-Gun/dsh-plugins/main/site/index.json    # 国内用（随发版即时更新）
 ```
 
 三步：
@@ -66,7 +66,7 @@ https://cdn.jsdelivr.net/gh/Bao-Gun/dsh-restart@main/site/index.json    # jsDeli
 2. 点「安装」，确认框里核对版本号和 commit，装完点「立即启用」。
 3. 点侧栏账号菜单里那颗「重启」——第一次重启之后按钮和弹窗才真正生效。
 
-两条 URL 怎么挑：GitHub Pages 在国内经常直连不通（NAS 上实测 `bao-gun.github.io` 和 `raw.githubusercontent.com` 都是超时/空响应，而 `github.com`、`cdn.jsdelivr.net` 是 200），所以国内机器优先贴 jsDelivr 那条。jsDelivr 对 `@main` 有缓存，部署后可能滞后十几分钟；要立刻装到最新就把 `@main` 换成 40 位 commit。索引怎么生成、发一版注意什么见 `docs/market.md`（仓库已转 public，这条路是通的）。
+两条 URL 怎么挑：GitHub Pages 在国内经常直连不通（NAS 上实测 `bao-gun.github.io` 和 `raw.githubusercontent.com` 都是空响应，而 `github.com`、`ghproxy.net` 是 200），所以国内机器贴 ghproxy 那条——它随发版立刻更新。jsDelivr（`cdn.`/`fastly.`/`gcore.` 同源缓存）能解析 `@main`，但响应头是 `max-age=604800, s-maxage=43200`，实测发版后调 `purge.jsdelivr.net` 报完成仍继续吐旧版本，别拿它装最新版。索引怎么生成、聚合索引什么时候重扫见 `docs/market.md`。
 
 两种装法互斥，切换时不能只改一半：
 
