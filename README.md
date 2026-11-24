@@ -4,6 +4,16 @@
 
 点「重启」默认就是「先检查、再重启」：把当前 profile 克隆一份、另起一个实例试跑，确认这堆插件还起得来，才真的重启。装坏的插件在重启之前就被拦下，而不是等 dsh web 起不来才发现。确实不想等这一轮（比如刚验证过、或者就是要强行拉起来），勾上「我知道风险，跳过检查直接重启」再点，就直接重启。
 
+## 支持的平台
+
+| 平台 | 状态 | 冒烟克隆走哪条 | 真机验证 |
+|---|---|---|---|
+| macOS 14+ | 日常用 | `cp -c -R`（APFS clonefile，快且省空间） | 本机 |
+| Linux x86_64（Debian 12 / FNOS NAS） | 可用 | `cp --reflink=auto -R`（btrfs/xfs 真 CoW；ext4 不报错、自动退化成整拷） | NAS 真机 2026-11-24：索引装 ≤20s、预检 11.4s、重启 7.5s |
+| Windows | 未支持 | —— | —— |
+
+Linux 上要保证 dsh web 进程的 `PATH` 里能找到 `dsh`（预检会调 `dsh --dump-config`，找不到直接 ENOENT，见 `docs/gotchas.md`）。
+
 ## 按钮做什么
 
 - 位置：左下角头像 → 更多 → 菜单倒数第二行「重启」（夹在「意见反馈」和登录 / 退出那一行之间）。侧栏底部不另加行，免得把「更多」挤掉。
@@ -43,7 +53,20 @@ node scripts/install.mjs --apply  # 真写：profile 的 package.json 依赖（l
 
 ## 走索引装
 
-仓库里带了插件市场索引源（`site/index.json`）：「插件 → 发现 → 添加索引源」贴上 `https://bao-gun.github.io/dsh-restart/index.json` 就能一键装，装的是索引里固定的那个 commit（`lib/*.js` 已在仓库里，装下来直接加载、不跑构建）。适合装到别的机器上，或者哪天不想再挂本机软链时。索引怎么生成、发一版注意什么见 `docs/market.md`（仓库已转 public，这条路是通的）。
+仓库里带了插件市场索引源（`site/index.json`）：「插件 → 发现 → 添加索引源」贴一条 URL 就能一键装，装的是索引里固定的那个 commit（`lib/*.js` 已在仓库里，装下来直接加载、不跑构建）。适合装到别的机器上，或者哪天不想再挂本机软链时。
+
+```
+https://bao-gun.github.io/dsh-restart/index.json                        # GitHub Pages 原站
+https://cdn.jsdelivr.net/gh/Bao-Gun/dsh-restart@main/site/index.json    # jsDelivr 镜像（国内可达）
+```
+
+三步：
+
+1. 插件 → 发现 → 「添加索引源」，贴上面任一条 URL（贴完列表里就有「重启与预检」）。
+2. 点「安装」，确认框里核对版本号和 commit，装完点「立即启用」。
+3. 点侧栏账号菜单里那颗「重启」——第一次重启之后按钮和弹窗才真正生效。
+
+两条 URL 怎么挑：GitHub Pages 在国内经常直连不通（NAS 上实测 `bao-gun.github.io` 和 `raw.githubusercontent.com` 都是超时/空响应，而 `github.com`、`cdn.jsdelivr.net` 是 200），所以国内机器优先贴 jsDelivr 那条。jsDelivr 对 `@main` 有缓存，部署后可能滞后十几分钟；要立刻装到最新就把 `@main` 换成 40 位 commit。索引怎么生成、发一版注意什么见 `docs/market.md`（仓库已转 public，这条路是通的）。
 
 两种装法互斥，切换时不能只改一半：
 

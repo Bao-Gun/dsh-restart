@@ -45,6 +45,8 @@ agent 调工具走同一套核心：`dsh_restart_precheck` → `runPrecheckRun`�
 - **判定回来不能只看 /health。** 用错 profile / `DSH_HOME` 的实例同样 200 /health，但侧栏没有按钮；必须再探插件自己的 status 路由 200，探不到就报「插件未加载」，不能报「已重启」。
 - **工具与路由共用同一份核心与 io。** `apply` 里只造一个 `io`，三条路由与 `registerTools(ctx, io)` 共用；预检锁（`acquirePrecheck`）与重启锁（`tryBeginRestart`）也各只有一份进程状态。禁止在工具里另写判定或另造 io——否则「最近一次预检」与互斥状态会各说各话，弹窗和 agent 会看到两个结论。
 - **工具返回值必须过输出 schema 的强校验。** 两个工具的输出 `additionalProperties: false` 且每个字段都 `required`；早退分支（缺 profile、busy、取消、异常）也要把字段填满（`port: 0`、`profileName: ''`、`failures: []`、`warnings: []`），绝不能留 undefined；`Failure` 的可选字段缺了就不复制。
+- **冒烟克隆绝不用硬链接。** `cp -al` / `ln` 会与真实 profile 共享 inode，试跑里写日志、写 auth、写会话都会落到线上 profile 上；只能用写时复制（macOS `-c`、Linux `--reflink=auto`）或整拷（`-R`）兜底，候选表只有一张（`src/server/clone.ts`）。
+- **索引里的 commit 必须自带三份产物。** `lib/index.js`、`lib/client.js`、`lib/helper.js` 缺一份，从市场装下来的包就起不来或按钮不出现；且它们必须与 HEAD 已提交的版本逐字节一致（否则索引指向旧产物，装了还是老版本）。`scripts/check-index.mjs` 把这条钉进 `check.sh` ⑥：版本号、commit、产物三样一起验。
 - **两个 POST 不收无来历的请求。** 先过宿主 `connection.requestRejection`，再要求 `Origin` 与 `Host` 一致且带 `x-dsh-restart: 1`；唯一例外是 helper 重启后回环地址的只读 `GET status` 探针，precheck / restart 永不享受这个例外。
 
 ## 维护

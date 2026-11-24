@@ -20,9 +20,12 @@
 pnpm build && bash check.sh
 # 3. 提交代码和产物，记下发出去的这个提交
 git add -A && git commit -m "feat: ..."
-# 4. 生成索引（它指向第 3 步的提交），再提交，然后推
-pnpm market:index && git add site/index.json && git commit -m "chore: 更新索引" && git push
+# 4. 生成索引（它指向第 3 步的提交），自检一遍，再提交，然后推
+pnpm market:index && node scripts/check-index.mjs
+git add site/index.json && git commit -m "chore: 更新索引" && git push
 ```
+
+`scripts/check-index.mjs` 是 `check.sh` ⑥ 用的同一个检查，单独跑它是因为它才是「发出去的东西能不能装」的判据：**索引里那个 commit 必须真的带 `lib/index.js`、`lib/client.js`、`lib/helper.js`，而且必须和 HEAD 里的逐字节一致**。少了这一步的典型翻车是「版本号改了、产物没进提交」——索引指向的提交里没有产物（装下来起不来），或者指向旧提交（装下来还是老版本），本地 `pnpm build` 一切正常，线上才炸。
 
 推上去之后 Actions 会重跑一次生成再部署，所以第 4 步的本地提交只是为了仓库自洽，不是必需。
 
@@ -38,8 +41,22 @@ https://<用户名>.github.io/dsh-restart/index.json
 - **git 源装的是仓库内容，装完直接加载包入口**：不跑 `prepare`、不装 devDependencies、不构建。所以 `lib/*.js` 必须进 git（`.gitignore` 只放掉 sourcemap），否则装下来 `main: lib/index.js` 不存在。**改完代码忘了 `pnpm build` 就提交，等于把旧产物发出去。** 判断要不要重建只看改动位置：动了 `src/` 就必须重建、并把变了的 `lib/*.js` 点名叫进同一提交；只动 `scripts/install.mjs` / `site/` / 文档则不用。查漂移最省事：跑 `bash check.sh`（内部会 `rm -rf lib && pnpm build`）后看 `git status`，没提交的 `lib/*.js` 会直接露出来。`.githooks/pre-commit` 会按同一条规则拦提交：动了 `src/`、`lib/` 的文件，`docs/`、`specs/` 里点名它的文档必须同批出现，缺一份就报 `[doc-drift]`。
 - 反过来，别指望 `prepare` 脚本救场：pnpm 11 会拦 git 依赖的构建脚本（`ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`），多一步审批，还得在装的人机器上装一套 tsup。
 - **索引里的 commit 必须是「产物已经在仓库里」的那个提交**，所以脚本自己不提交，顺序永远是 build → commit → 生成索引。
-- **仓库得是 public**：免费账号的私有仓库开不了 Pages，而且 git 源装私有仓库要凭据，「贴个 URL 就能装」就不成立了。仓库当前是 private，改成 public 之前 Pages 这一步不会成功。
+- **仓库得是 public**：免费账号的私有仓库开不了 Pages，而且 git 源装私有仓库要凭据，「贴个 URL 就能装」就不成立了。仓库已转 public，Pages 也在正常部署。
+- **国内机器贴 jsDelivr 镜像那条 URL。** GitHub Pages 的域名（`<用户名>.github.io`）与 `raw.githubusercontent.com` 在 NAS 上实测都不可达（DNS/污染，curl 直接空响应），`github.com` 与 `cdn.jsdelivr.net` 正常。索引 URL 换成 `https://cdn.jsdelivr.net/gh/Bao-Gun/dsh-restart@main/site/index.json` 就能装。注意 jsDelivr 对 `@main` 有缓存，部署后可能滞后十几分钟；要立刻拿到最新就写 `@<40 位 commit>`。
 - 托管有硬性要求：UTF-8 JSON、2xx、**不许重定向**、默认不超过 128 MiB。GitHub Pages 满足；换成对象存储或自建服务时注意别加一层 `301`。
+
+## 真机验收记录（2026-11-24，飞牛 NAS / Debian 12 / ext4 / dsh 0.2.2-rc.5）
+
+从「发现」页真点了一遍，不是脚本模拟：
+
+| 环节 | 实测 |
+| --- | --- |
+| 添加索引源（jsDelivr 镜像）→ 列表出现「重启与预检 0.2.0」 | 正常，确认框显示 commit `80a79a3` |
+| 安装（git 源，clone + 装 node_modules） | ≤20s；装完 profile `package.json` 得到 `github:Bao-Gun/dsh-restart#80a79a3…`，`node_modules/dsh-restart` 就位 |
+| 预检 | 11.4s，failures 0 / warnings 29（全是 NAS 上 patch 里那些模型条目缺 `package.json` 的提示） |
+| 重启 | helper 7.5s 回到 healthy：`port before up` → `port down (+316ms)` → 新实例拉起 → `port up (+6857ms)` |
+| 克隆耗时（84M profile） | `cp --reflink=auto -R` 0.18s、`cp -R` 0.17s（ext4 无 reflink，两者等价）、`cp -c` 报 invalid option |
+| 「上次结果」 | 重启后重开弹窗显示「2026-11-24 11:46 预检通过 · 29 条提示」 |
 
 ## 本地先验一遍
 
