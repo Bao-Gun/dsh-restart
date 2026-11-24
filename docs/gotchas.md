@@ -10,7 +10,7 @@
 - 真实 CLI 的 profile 写法（0.2.2-rc.5 实测）：`dsh --help` 的 usage 是 `dsh [--profile] <name> [options] [app-args...]`，examples 里自拉起写法是 `dsh --profile web --no-open`；`dsh web --help` 的 usage 是 `dsh --profile web [options]`；`dsh-daemon --help` 确认存在 `restart` 子命令。→ argv 只能用一种写法，别再假设 `dsh web ...` 是唯一入口。
 - `/health` 200 ≠ 插件已加载：用错 profile / `DSH_HOME` 的 dsh web 照样 200 `/health`，但 `/dsh-restart/api/status` 是 404，界面上没有按钮 → helper 必须第二段探插件状态路由（200 才算成功），探不到就报「插件未加载」，不能报「已重启」。
 - 在真实 cordis ctx 上直接 `Reflect.get(ctx, 'connection')` 会抛 `cannot get property "connection" without inject`（测试里 mock 的 ctx 是普通对象，照不到这条规则，单测全绿也挡不住）→ cordis 对未声明 inject 的服务做了属性访问拦截，只能用 `ctx.get('connection')` → `connectionOf` 先 `ctx.get`，取不到再用反射兜底（src/index.ts:548-565）。
-- 冒烟克隆 profile 用 `cp -al`（硬链接）→ 副本与真实 profile 共享 inode，试跑里写日志、写 auth、写会话都会落到线上 profile → 必须 `cp -c`（APFS clonefile，写时复制）；`cp -c` 失败只退回 `cp -R`（真复制），绝不退回 `cp -al`（src/server/smoke.ts:15）。
+- 冒烟克隆 profile 用 `cp -al`（硬链接）→ 副本与真实 profile 共享 inode，试跑里写日志、写 auth、写会话都会落到线上 profile → 必须写时复制克隆（macOS `cp -c`、Linux `--reflink=auto`，候选表见 `src/server/clone.ts`）；快路径失败只退回 `cp -R`（真复制），绝不退回 `cp -al`。
 - 冒烟起的 dsh 会把 sidecar 一起拉进同一个进程组，只按 pid 杀 → sidecar 变孤儿继续占端口，下一次冒烟直接假红 → 起子进程时 `detached` 建独立进程组，收尾用 `kill(-pid)` 打整个组（SIGTERM → 轮询 → SIGKILL），并轮询确认组里没人了才算清干净（src/server/smoke.ts:238-267）。
 - 往 profile 的 `cordis.patch.yml` 加顶层 `- id: restart-button` → 宿主只打印一条告警，不会新增条目，插件永远装不上 → 顶层 `- id:` 只能改已有条目，新增必须用 `- insert:` 块；`scripts/install.mjs` 的 `readPatchSnippet` 会强制校验片段以 `- insert:` 开头（install.mjs:59-66）。
 - 客户端插件产物写成 esm 或忘了包一行自注册 → 宿主不加载、也不报错，按钮永远不出现，单测和构建都绿 → 客户端必须是 classic script 且自带 `window.__ModuleLoader__.load({ id, factory })`；tsup 客户端那份用 iife + banner/footer 把模块体包进 factory，保证首行自注册、副作用延迟到 materialize（tsup.config.ts:26-42）。
@@ -33,4 +33,5 @@
 - 弹窗里两颗按钮（「开始检查」+「重启」）→ 用户想重启得先点检查、再点重启，多一步；更糟的是勾选框当时只在「本轮判红」时才出现，等于「想强制重启，必须先失败一次」 → 收敛成一颗「重启」：点它默认就是先预检后重启，勾上「跳过检查」等价于旧的强制重启（`src/client/dialog.ts`）。预检按钮删掉后，「上次通过」不能当本轮通过，指纹过期照样重跑（`src/client/dialog.ts` 的 `renderStatus`）。
 - 改成从索引按 bundle 装之后，`pnpm add <git spec>` 只写进 `dependencies`，宿主不会自动登记进 `dsh.profile.bundles`（插件的 reconcile 只管「新增」依赖，已在 dependencies 里的包它不管）→ 装完 stderr 一句 `1 entry did not activate`、按钮静默消失 → 装完手动把包名加进 `dsh.profile.bundles`；同时把 profile `cordis.patch.yml` 里手写的 `restart-button` insert 删掉——bundle 自带的 patch 已经插过一次，两处都在就会插两次。因此上一条「实在不行删 patch 里的 insert 块」在 bundle 装法下要改成摘 `dsh.profile.bundles`（README「万一没回来」已按这个写）。
 - 「上次结果」直接 `at.slice(0,16)` 切 UTC ISO 字符串 → UTC+8 机器上显示的时间永远少 8 小时（真机显示 14:26，实际 22:26） → `at` 是服务端 `toISOString()` 落的 UTC，必须 `new Date(at)` 后按本机时区的 `getFullYear/getHours` 拼字符串（`src/client/dialog.ts` 的 `formatTime`）。
+- GNU coreutils 的 `cp` 没有 `-c`（clonefile 是 macOS/BSD 特有）→ Linux（Debian NAS）上冒烟报 `cp: invalid option -- 'c'`，预检直接红，NAS 上永远点不了重启 → 克隆参数按平台给候选表：darwin 首选 `-c -R`、linux 首选 `--reflink=auto -R`（btrfs/xfs 真 CoW，ext4 自动退化成整拷）、其它平台与兜底一律 `-R`；冒烟与 `scripts/install.mjs` 共用同一张表，由 `test/clone.test.ts` 钉住两边一致（`src/server/clone.ts`）。
 

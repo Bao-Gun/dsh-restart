@@ -3,7 +3,7 @@
  * dsh-restart 安装脚本：把本仓库链进 DSH web profile，并让 profile 的 cordis patch 认领它。
  *
  * 默认 dry-run：只读 profile，打印将要做的每一项改动；加 --apply 才写。
- * --verify：在克隆出来的临时 DSH_HOME 里重做一遍安装（macOS 用 cp -c，其它平台或失败回退 cp -R），另起一个 port=0 的实例，
+ * --verify：在克隆出来的临时 DSH_HOME 里重做一遍安装（按平台依次试 cp 候选：clonefile / reflink / 普通拷贝），另起一个 port=0 的实例，
  *          探到 /health 200 且 /dsh-restart/api/status 200 才算通过，随后回收进程组、删除临时目录。
  *
  * 只使用 node: 内置模块，不引入第三方依赖，也不参与 tsc。
@@ -418,9 +418,28 @@ async function installIntoCopy(profileCopy, repoDir) {
 
 export const VERIFY_DIR_PREFIX = 'dsh-restart-verify-'
 
-/** 克隆参数：macOS 用 APFS clonefile（-c），其它平台普通 -R；--verify 会打印实际用的形态。 */
+/**
+ * 克隆候选表：与 src/server/clone.ts 的 cloneCandidates 完全一致（这里是纯 JS，不能 import TS），
+ * test/clone.test.ts 把两边钉在一起——改表必须同批改两个文件。
+ *
+ * - darwin：APFS clonefile（-c）优先，不支持时退回真拷贝；
+ * - linux：--reflink=auto 在 btrfs/xfs 上真 CoW，ext4 上自动退化成整拷，老 coreutils 不认就退回 -R；
+ * - 其它平台只给普通 -R。绝不用硬链接（-l）：会共享 inode，副本里的写入会落到线上 profile。
+ */
+export function cloneCandidateList(source, dest, platform = process.platform) {
+  if (platform === 'darwin') return [['-c', '-R', source, dest], ['-R', source, dest]]
+  if (platform === 'linux') return [['--reflink=auto', '-R', source, dest], ['-R', source, dest]]
+  return [['-R', source, dest]]
+}
+
+/** 首选参数（保留旧签名，已有调用方不受影响）；--verify 会打印实际用的那一组。 */
 export function cloneArgs(source, dest, platform = process.platform) {
-  return platform === 'darwin' ? ['-c', '-R', source, dest] : ['-R', source, dest]
+  return cloneCandidateList(source, dest, platform)[0]
+}
+
+/** cp 的参数里前两段是选项，最后两段是 source / dest；日志只打印选项，路径另外给。 */
+function cloneOptionLabel(args) {
+  return `cp ${args.slice(0, -2).join(' ')}`
 }
 
 /** 独立实例的启动参数：端口 0 由宿主分配，绝不碰已有的 3080。 */
@@ -571,15 +590,23 @@ export async function runVerify({
     const profilesDir = join(home, 'profiles')
     await mkdir(profilesDir, { recursive: true })
     const profileCopy = join(profilesDir, 'web')
-    let cloneLabel = process.platform === 'darwin' ? 'cp -c -R' : 'cp -R（非 macOS）'
-    let copied = spawnSync('cp', cloneArgs(profileDir, profileCopy), { encoding: 'utf8' })
-    if (copied.status !== 0 && process.platform === 'darwin') {
+    // 按平台给的候选表逐个试；每一次失败先清掉可能留下的半个目标目录，再换下一组参数。
+    const cloneFailures = []
+    let cloneLabel = null
+    for (const args of cloneCandidateList(profileDir, profileCopy)) {
+      const copied = spawnSync('cp', args, { encoding: 'utf8' })
+      if (copied.status === 0) {
+        cloneLabel = cloneOptionLabel(args)
+        break
+      }
+      const detail = copied.error
+        ? copied.error.message
+        : (copied.stderr || '').trim() || `exit ${copied.status}`
+      cloneFailures.push(`${cloneOptionLabel(args)}：${detail}`)
       await rm(profileCopy, { recursive: true, force: true }).catch(() => {})
-      copied = spawnSync('cp', cloneArgs(profileDir, profileCopy, 'linux'), { encoding: 'utf8' })
-      cloneLabel = 'cp -R（clonefile 失败，已回退）'
     }
-    if (copied.status !== 0) {
-      throw new InstallError(`${cloneLabel} 克隆 profile 失败: ${(copied.stderr || '').trim() || `exit ${copied.status}`}`)
+    if (cloneLabel === null) {
+      throw new InstallError(`克隆 profile 失败：${cloneFailures.join('；')}`)
     }
     record('clone', true, `${cloneLabel} → ${profileCopy}`)
 
@@ -672,7 +699,7 @@ const HELP = `用法: node scripts/install.mjs [--profile <dir>] [--repo <dir>] 
 
 默认 dry-run：只打印计划，不写任何文件。
   --apply    真正写入 profile 的 package.json / cordis.patch.yml，并删除悬空软链；成功后补 pnpm --lockfile-only
-  --verify   在克隆的临时 DSH_HOME 里起 port=0 实例，探 /health 与 status 200（macOS 用 cp -c，其它回退 cp -R）
+  --verify   在克隆的临时 DSH_HOME 里起 port=0 实例，探 /health 与 status 200（macOS 先试 cp -c，Linux 先试 --reflink=auto，失败都退回 cp -R）
   --profile  默认 ~/.dsh/profiles/web
   --repo     默认本仓库根目录
 `

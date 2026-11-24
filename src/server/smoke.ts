@@ -7,12 +7,14 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { promisify } from 'node:util'
 
 import type { Failure } from '../shared/types'
+import { cloneCandidates } from './clone'
 
 /**
  * 预检 C：克隆当前 profile 到临时 DSH_HOME，另起一个 dsh web，等 /health，收未激活名单。
  *
  * 三个安全点：
- * - 克隆必须用 APFS clonefile（cp -c）。硬链接会共享 inode，试跑写日志/auth 会写进线上 profile。
+ * - 克隆按 `cloneCandidates` 的候选表逐个试（darwin clonefile / linux reflink / 普通 -R）。
+ *   绝不用硬链接：硬链接会共享 inode，试跑写日志/auth 会写进线上 profile。
  * - 无论成功失败，finally 里都要杀掉整个进程组并删掉临时目录，不能留孤儿进程。
  * - 组长（dsh 主进程）可能比同组 sidecar 先退出，所以组清理以「组里还有没有成员」为准，
  *   不能以直接子进程退没退出来短路。
@@ -539,23 +541,38 @@ export async function runDumpConfig(profileDir: string): Promise<Failure[]> {
   }))
 }
 
-/** 先试 APFS clonefile；文件系统不支持时退回真拷贝。目标一定在本次临时目录里。 */
-async function cloneProfile(source: string, dest: string): Promise<Failure | null> {
-  const cloned = await runCommand('cp', ['-c', '-R', source, dest], { timeoutMs: CLONE_TIMEOUT_MS })
-  if (cloned.code === 0) return null
+/** 快路径（clonefile / reflink）失败要快；兜底的普通 -R 是整拷贝，给更长的预算。 */
+function cloneAttemptTimeoutMs(args: string[]): number {
+  return args.includes('-c') || args.includes('--reflink=auto') ? CLONE_TIMEOUT_MS : COPY_TIMEOUT_MS
+}
 
-  // cp -c 失败时可能留下半个目标目录，重试前清掉
-  await rm(dest, { recursive: true, force: true }).catch(() => undefined)
-  const copied = await runCommand('cp', ['-R', source, dest], { timeoutMs: COPY_TIMEOUT_MS })
-  if (copied.code === 0) return null
+/** 报错里只带 cp 的选项（候选表最后两段固定是 source / dest），逐条列出「用了什么参数：为什么失败」。 */
+function describeCloneAttempt(args: string[], outcome: CommandOutcome, timeoutMs: number): string {
+  const command = 'cp ' + args.slice(0, -2).join(' ')
+  if (outcome.timedOut) return command + '：克隆超时（' + String(timeoutMs) + ' ms）'
+  return command + '：' + describeCommand(outcome)
+}
+
+/**
+ * 按平台候选表克隆：首选 CoW 快路径，失败清掉半个目标目录再换下一组；首个成功即返回。
+ * 目标一定在本次临时目录里；全失败时逐条列出参数与原因（超时单独标注，不混成「插件起不来」）。
+ */
+async function cloneProfile(source: string, dest: string): Promise<Failure | null> {
+  const candidates = cloneCandidates(process.platform, source, dest)
+  const attempts: string[] = []
+  for (const args of candidates) {
+    const timeoutMs = cloneAttemptTimeoutMs(args)
+    const outcome = await runCommand('cp', args, { timeoutMs })
+    if (outcome.code === 0) return null
+
+    attempts.push(describeCloneAttempt(args, outcome, timeoutMs))
+    // 失败的候选可能留下半个目标目录，下一组重试前清掉
+    await rm(dest, { recursive: true, force: true }).catch(() => undefined)
+  }
 
   return {
     kind: 'boot',
-    message:
-      '克隆 profile 失败：cp -c ' +
-      describeCommand(cloned) +
-      '；cp -R ' +
-      describeCommand(copied),
+    message: '克隆 profile 失败：' + attempts.join('；'),
   }
 }
 

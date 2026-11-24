@@ -357,10 +357,11 @@ describe('安装失败态：顺序与自愈提示', () => {
 })
 
 describe('--verify 纯逻辑', () => {
-  it('cloneArgs 在 macOS 用 clonefile，其它平台用普通 -R', async () => {
+  it('cloneArgs 返回候选表的首选：macOS clonefile、Linux reflink、其它平台普通 -R', async () => {
     const install = await loadInstall()
     expect(install.cloneArgs('/a', '/b', 'darwin')).toEqual(['-c', '-R', '/a', '/b'])
-    expect(install.cloneArgs('/a', '/b', 'linux')).toEqual(['-R', '/a', '/b'])
+    expect(install.cloneArgs('/a', '/b', 'linux')).toEqual(['--reflink=auto', '-R', '/a', '/b'])
+    expect(install.cloneArgs('/a', '/b', 'freebsd')).toEqual(['-R', '/a', '/b'])
   })
 
   it('launchArgs 固定 port 0（不碰 3080）且 no-open', async () => {
