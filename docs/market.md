@@ -77,7 +77,7 @@ https://ghproxy.net/https://raw.githubusercontent.com/Bao-Gun/dsh-plugins/main/s
 | 环节 | 实测 |
 | --- | --- |
 | 添加索引源（当时还是本仓单独一条 jsDelivr 地址）→ 列表出现「重启与预检 0.2.0」 | 正常，确认框显示 commit `80a79a3` |
-| 索引源换成聚合索引（ghproxy 镜像）→ 列表同时出现「重启与预检 0.2.0」和「升级 0.1.0」 | 正常；`dsh --profile web --dump-config` 里只剩这一条索引源，官方 `parseMarketIndex` 解析出 `dsh-restart@0.2.0#5ea4149` |
+| 索引源换成聚合索引（ghproxy 镜像） | `dsh --profile web --dump-config` 里只剩这一条；NAS 上 curl 该 URL 200、0 重定向；官方 `parseMarketIndex` 解析出 `dsh-restart@0.2.0#5ea4149`、`dsh-upgrade@0.1.0`。界面未再点一遍（安装路径本身上面已实测） |
 | 安装（git 源，clone + 装 node_modules） | ≤20s；装完 profile `package.json` 得到 `github:Bao-Gun/dsh-restart#80a79a3…`，`node_modules/dsh-restart` 就位 |
 | 预检 | 11.4s，failures 0 / warnings 29（全是 NAS 上 patch 里那些模型条目缺 `package.json` 的提示） |
 | 重启 | helper 7.5s 回到 healthy：`port before up` → `port down (+316ms)` → 新实例拉起 → `port up (+6857ms)` |
