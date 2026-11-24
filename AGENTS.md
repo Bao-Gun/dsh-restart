@@ -35,8 +35,8 @@
 
 ## 命令
 
-- 安装（日常）：插件市场索引源一键装，贴 `https://bao-gun.github.io/dsh-restart/index.json`；终端等价做法是 `pnpm add git+…#<commit>` 再把包名写进 profile 的 `dsh.profile.bundles`（少了这步就是「装了不生效」）。见 `README.md`「装它」。
-- 开发：`pnpm install && pnpm build` → `node scripts/install.mjs --verify`（克隆副本里试跑）。`--apply` 是本机 `link:` 链路，与索引装互斥（同开会把按钮插两次）。
+- 安装（日常）：本机挂软链 `pnpm install && pnpm build` → `node scripts/install.mjs`（dry-run）→ 加 `--apply` → 重启 dsh web。可选 `--verify` 先在克隆副本里验证。改完代码 `pnpm build` + 点重启即可见，不用发版。见 `README.md`「装它」。
+- 发版/装到别的机器：插件市场索引源 `https://bao-gun.github.io/dsh-restart/index.json` 一键装（装的是索引固定 commit，还要把包名写进 profile 的 `dsh.profile.bundles`）。与软链装法互斥，切换步骤在 `README.md`「走索引装」。
 - 检查：`bash check.sh`（唯一判断对错的方式，别靠肉眼；底层是 `pnpm test`）。收尾要贴出退出码和结果行再说完成。
 - 并行开发：工作树放 `.worktrees/`（已在忽略列表）。有 harness 原生 worktree 工具就用它，别手搓 `git worktree`。
 - 发索引：`pnpm build` → 提交代码（含 `lib/*.js`）→ `pnpm market:index` → 再提交 `site/index.json`。顺序反了索引就指向没有产物的提交。

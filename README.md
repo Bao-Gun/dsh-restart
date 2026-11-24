@@ -28,34 +28,29 @@
 - 其它不重启的 `reason`：`busy`（已有重启或预检在进行）、`no-profile`、`no-port`（webServer 还没监听端口）、`precheck-busy`、`cancelled`、`error`。
 - 两个工具与 HTTP 路由共用 `src/server/precheck.ts` / `src/server/issue.ts` 这一份判定核心和同一个 io，不会各算各的。
 
-## 装它
+## 装它（现在用的就是这条）
 
-日常就这一条路，不用 clone 本仓库：「插件 → 发现 → 添加索引源」贴上 `https://bao-gun.github.io/dsh-restart/index.json`，点装完事。想一次列全我的插件就贴聚合索引 `https://bao-gun.github.io/dsh-plugins/index.json`。
-
-索引里固定 `type: git` + 40 位 commit，装的就是发版那个提交；`lib/*.js` 已经在仓库里，装下来直接加载、不跑构建。索引怎么生成、发一版注意什么见 `docs/market.md`（仓库已转 public，这条路是通的）。
-
-不想开界面时，等价的做法：
-
-```bash
-cd ~/.dsh/profiles/web
-pnpm add "git+https://github.com/Bao-Gun/dsh-restart.git#<索引里那个 40 位 commit>"
-$EDITOR package.json    # 把 "dsh-restart" 加进 dsh.profile.bundles 数组
-```
-
-这个手动登记不能省：宿主只给 `dsh.profile.bundles` 里的包加载它自带的 `cordis.patch.yml`，光进 `dependencies` 是「装了不生效」。同理也别再往 profile 的 `cordis.patch.yml` 手写 `restart-button`，bundle 已经插过一次，重复插会多出按钮。
-
-装完重启一次 dsh web 让 profile 重新加载；往后就点侧栏那颗按钮了。
-
-## 本地开发
-
-改代码时才需要（改完 `pnpm build`，`lib/*.js` 要跟着提交，否则发出去的是旧产物）：
+本机日常装的是软链，改完代码立刻能验：
 
 ```bash
 pnpm install && pnpm build        # 产物: lib/index.js、lib/client.js、lib/helper.js
-node scripts/install.mjs --verify # 在 cp -c 克隆的副本里装一遍，起 port=0 实例，探 status 200
+node scripts/install.mjs          # dry-run：只打印将写进 profile 的改动，不动文件
+node scripts/install.mjs --verify # 可选：在 cp -c 克隆的副本里装一遍，起 port=0 实例，探 status 200
+node scripts/install.mjs --apply  # 真写：profile 的 package.json 依赖（link:）、cordis.patch.yml 的 insert 块、node_modules 软链
 ```
 
-`node scripts/install.mjs --apply` 是本机 `link:` 链路（往 profile 写依赖 + `cordis.patch.yml` 的 insert 块），跟索引装互斥：要用它，先把 `"dsh-restart"` 从 `dsh.profile.bundles` 摘掉、`pnpm remove dsh-restart`，否则按钮会被插两次；切回索引装就照上一节重来。
+装完重启一次 dsh web 让 profile 重新加载（第一次只能手动，之后点侧栏那颗按钮）。往后改 `src/` → `pnpm build` → 点重启，就是新代码，不用发版。
+
+## 走索引装
+
+仓库里带了插件市场索引源（`site/index.json`）：「插件 → 发现 → 添加索引源」贴上 `https://bao-gun.github.io/dsh-restart/index.json` 就能一键装，装的是索引里固定的那个 commit（`lib/*.js` 已在仓库里，装下来直接加载、不跑构建）。适合装到别的机器上，或者哪天不想再挂本机软链时。索引怎么生成、发一版注意什么见 `docs/market.md`（仓库已转 public，这条路是通的）。
+
+两种装法互斥，切换时不能只改一半：
+
+- **软链 → 索引**：`cd ~/.dsh/profiles/web && pnpm remove dsh-restart`，删掉 `node_modules/dsh-restart` 软链，删掉 profile `cordis.patch.yml` 里 `restart-button` 那条 insert，再 `pnpm add "git+https://github.com/Bao-Gun/dsh-restart.git#<索引里的 40 位 commit>"`，最后把 `"dsh-restart"` 加进 `package.json` 的 `dsh.profile.bundles`。
+- **索引 → 软链**：从 `dsh.profile.bundles` 摘掉 `"dsh-restart"`、`pnpm remove dsh-restart`，再跑一遍 `node scripts/install.mjs --apply`。
+
+`dsh.profile.bundles` 那一步只在索引装法里要：宿主只给 bundles 里的包加载它自带的 `cordis.patch.yml`，光进 `dependencies` 是「装了不生效」；而软链装法是自己往 profile patch 里写 insert，两处都留就会多插一个按钮。
 
 ## 第一次装完怎么确认生效
 
@@ -63,7 +58,7 @@ node scripts/install.mjs --verify # 在 cp -c 克隆的副本里装一遍，起 
 
 看不到这一行时按这个顺序查：
 
-1. 在 `~/.dsh/profiles/web` 里 `pnpm list dsh-restart` 看依赖是不是 `github:Bao-Gun/dsh-restart#<commit>`，再确认 `package.json` 的 `dsh.profile.bundles` 里有 `"dsh-restart"`——依赖在、bundles 里没有，就是「装了不生效」。
+1. 跑 `node scripts/install.mjs`：结论应是「全部已一致」；若还列着待改动项，说明 --apply 没写进去。（索引装法则改成查依赖是不是 `github:Bao-Gun/dsh-restart#<commit>`、以及 `dsh.profile.bundles` 里有 `"dsh-restart"`。）
 2. 看 dsh web 的 stderr 有没有 `1 entry did not activate`——插件解析不到时 dsh web 照样起得来，只是按钮不出现，失败模式是「静默消失」而不是「起不来」（见 docs/gotchas.md）。
 3. `curl -H 'x-dsh-restart: 1' http://127.0.0.1:3080/dsh-restart/api/status`：404 说明插件没加载，200 说明只是菜单行没插上。
 
@@ -80,9 +75,9 @@ dsh web                           # 还不行就前台起一次，报错直接�
 如果报错指向本插件（`dsh-restart` 加载失败），先把它从 profile 摘掉再起：
 
 ```bash
-# 插件是 bundle：从 profile 的 package.json 的 dsh.profile.bundles 里删掉 "dsh-restart"
-$EDITOR ~/.dsh/profiles/web/package.json
-# 连包一起清：cd ~/.dsh/profiles/web && pnpm remove dsh-restart
+# 编辑 profile 的 cordis.patch.yml，删掉 id: restart-button 那个 insert 块
+$EDITOR ~/.dsh/profiles/web/cordis.patch.yml
+# 索引装法则改摘 package.json 的 dsh.profile.bundles 里的 "dsh-restart"
 # 然后照常 dsh web；插件摘掉后 dsh web 一定能起（失败模式只会是「按钮不出现」）
 ```
 
