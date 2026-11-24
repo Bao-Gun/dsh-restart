@@ -14,6 +14,7 @@ import {
   diffFailedEntries,
   killProcessTree,
   parseNotActivated,
+  parsePsIdentity,
 } from '../src/server/smoke'
 import type { CommandOutcome } from '../src/server/smoke'
 
@@ -57,12 +58,11 @@ function psIdentity(pid: number): { lstart: string; command: string } | null {
   try {
     const text = execFileSync('ps', ['-p', String(pid), '-o', 'lstart=', '-o', 'command='], {
       encoding: 'utf8',
-      // 跟生产代码一样钉住 C 语言环境：zh_CN 下 ps 的日期格式不同，正则会对不上。
+      // 跟生产代码一样钉住 C 语言环境：zh_CN 下 ps 的日期格式不同，解析不出身份。
       env: { ...process.env, LC_ALL: 'C', LANG: 'C' },
-    }).trim()
-    const match = /^(\S{3}\s+\S{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$/.exec(text)
-    if (match === null) return null
-    return { lstart: match[1] ?? '', command: (match[2] ?? '').trim() }
+    })
+    // 直接复用被测解析：测试取的 ps 样本与生产走同一条正则，不另抄一份
+    return parsePsIdentity(text)
   } catch {
     return null
   }
@@ -154,6 +154,54 @@ describe('diffFailedEntries', () => {
     expect(diffFailedEntries(['a'], ['b', 'b', 'c'])).toEqual({
       added: ['a'],
       removed: ['b', 'c'],
+    })
+  })
+})
+
+describe('parsePsIdentity', () => {
+  it('解析 macOS C locale 的 lstart 与完整 command', () => {
+    // 本机 macOS 实采形态
+    expect(
+      parsePsIdentity(
+        'Mon Nov 24 10:31:59 2026 /usr/local/bin/node /usr/local/bin/dsh --profile web --port 0 --no-open',
+      ),
+    ).toEqual({
+      lstart: 'Mon Nov 24 10:31:59 2026',
+      command: '/usr/local/bin/node /usr/local/bin/dsh --profile web --port 0 --no-open',
+    })
+  })
+
+  it('Linux（Debian NAS）同形样本一样解析', () => {
+    // NAS 上 LC_ALL=C 实采：'Tue Nov 24 10:31:59 2026 ...'
+    expect(
+      parsePsIdentity(
+        'Tue Nov 24 10:31:59 2026 /usr/bin/node /usr/lib/node_modules/dsh/bin/dsh --profile web',
+      ),
+    ).toEqual({
+      lstart: 'Tue Nov 24 10:31:59 2026',
+      command: '/usr/bin/node /usr/lib/node_modules/dsh/bin/dsh --profile web',
+    })
+  })
+
+  it('zh_CN 的「一 11/23 22:40:14 2026」形态返回 null，调用方按「无法确认」处理', () => {
+    expect(
+      parsePsIdentity('  一 11/23 22:40:14 2026 /usr/local/bin/node /usr/local/bin/dsh web'),
+    ).toBeNull()
+  })
+
+  it('空串与只有空白的串返回 null', () => {
+    expect(parsePsIdentity('')).toBeNull()
+    expect(parsePsIdentity(' \n ')).toBeNull()
+  })
+
+  it('有 lstart 但没有 command 时返回 null', () => {
+    expect(parsePsIdentity('Mon Nov 24 10:31:59 2026')).toBeNull()
+  })
+
+  it('stdout 自带的尾部换行不影响解析', () => {
+    expect(parsePsIdentity('Mon Nov 24 10:31:59 2026 /usr/local/bin/node dsh web\n')).toEqual({
+      lstart: 'Mon Nov 24 10:31:59 2026',
+      command: '/usr/local/bin/node dsh web',
     })
   })
 })

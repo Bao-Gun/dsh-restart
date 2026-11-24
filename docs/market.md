@@ -35,7 +35,7 @@ https://<用户名>.github.io/dsh-restart/index.json
 ## 硬约束（都是踩出来的）
 
 - **索引的 `source` 只有 npm 和 git 两种。** `dsh-restart` 这个名字在 npm 上已被别人占用（0.1.2），走 npm 会装到别人的包，所以这里固定 `type: "git"` + 40 位小写 commit。
-- **git 源装的是仓库内容，装完直接加载包入口**：不跑 `prepare`、不装 devDependencies、不构建。所以 `lib/*.js` 必须进 git（`.gitignore` 只放掉 sourcemap），否则装下来 `main: lib/index.js` 不存在。**改完代码忘了 `pnpm build` 就提交，等于把旧产物发出去。** 判断要不要重建只看改动位置：动了 `src/` 就必须重建、并把变了的 `lib/*.js` 点名叫进同一提交；只动 `scripts/install.mjs` / `site/` / 文档则不用。查漂移最省事：跑 `bash check.sh`（内部会 `rm -rf lib && pnpm build`）后看 `git status`，没提交的 `lib/*.js` 会直接露出来。
+- **git 源装的是仓库内容，装完直接加载包入口**：不跑 `prepare`、不装 devDependencies、不构建。所以 `lib/*.js` 必须进 git（`.gitignore` 只放掉 sourcemap），否则装下来 `main: lib/index.js` 不存在。**改完代码忘了 `pnpm build` 就提交，等于把旧产物发出去。** 判断要不要重建只看改动位置：动了 `src/` 就必须重建、并把变了的 `lib/*.js` 点名叫进同一提交；只动 `scripts/install.mjs` / `site/` / 文档则不用。查漂移最省事：跑 `bash check.sh`（内部会 `rm -rf lib && pnpm build`）后看 `git status`，没提交的 `lib/*.js` 会直接露出来。`.githooks/pre-commit` 会按同一条规则拦提交：动了 `src/`、`lib/` 的文件，`docs/`、`specs/` 里点名它的文档必须同批出现，缺一份就报 `[doc-drift]`。
 - 反过来，别指望 `prepare` 脚本救场：pnpm 11 会拦 git 依赖的构建脚本（`ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`），多一步审批，还得在装的人机器上装一套 tsup。
 - **索引里的 commit 必须是「产物已经在仓库里」的那个提交**，所以脚本自己不提交，顺序永远是 build → commit → 生成索引。
 - **仓库得是 public**：免费账号的私有仓库开不了 Pages，而且 git 源装私有仓库要凭据，「贴个 URL 就能装」就不成立了。仓库当前是 private，改成 public 之前 Pages 这一步不会成功。

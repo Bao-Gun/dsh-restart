@@ -166,9 +166,27 @@ function processAlive(pid: number): boolean {
   }
 }
 
-interface ProcessIdentity {
+/** ps 的 lstart 与完整 command；取不到就返回 null，调用方按「无法确认」处理。 */
+export interface ProcessIdentity {
   lstart: string
   command: string
+}
+
+/** C locale 的 lstart（「Mon Nov 24 10:31:59 2026」，macOS / Linux 同形）后面跟整条 command。 */
+const PS_IDENTITY_LINE = /^(\S{3}\s+\S{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$/
+
+/**
+ * 把 `ps -p PID -o lstart= -o command=` 的一行输出拆成身份；对不上就返回 null。
+ * 只认 C locale 形态：zh_CN 的「一 11/23 22:40:14 2026」解析不出来，
+ * 调用方会退化成「无法确认」，宁可不发信号也不误杀。
+ */
+export function parsePsIdentity(line: string): ProcessIdentity | null {
+  const match = PS_IDENTITY_LINE.exec(line.trim())
+  if (match === null) return null
+  const lstart = match[1] ?? ''
+  const command = (match[2] ?? '').trim()
+  if (lstart === '' || command === '') return null
+  return { lstart, command }
 }
 
 /** 只认命令行里真的出现 dsh；配合 lstart 与整条 command 比对，防 pid 复用误杀。 */
@@ -176,7 +194,7 @@ function isDshCommand(command: string): boolean {
   return /\bdsh\b/.test(command)
 }
 
-/** ps 的 lstart 与完整 command；取不到就返回 null，调用方按「无法确认」处理。 */
+/** 取 ps 的 lstart 与完整 command；取不到就返回 null，调用方按「无法确认」处理。 */
 async function probeProcessIdentity(pid: number): Promise<ProcessIdentity | null> {
   if (process.platform === 'win32') return null
   try {
@@ -188,18 +206,12 @@ async function probeProcessIdentity(pid: number): Promise<ProcessIdentity | null
         maxBuffer: 64 * 1024,
         encoding: 'utf8',
         // 必须钉住 C 语言环境：zh_CN 下 macOS 的 ps 会把日期打成「一 11/23 22:40:14 2026」，
-        // 与下面这条正则对不上，于是所有身份比对都退化成「无法确认」——清扫不再发信号，
+        // 与下面的 parsePsIdentity 对不上，于是所有身份比对都退化成「无法确认」——清扫不再发信号，
         // 孤儿实例就这样活下来（2026-11-23 本机 LANG=zh_CN.UTF-8 实测）。
         env: { ...process.env, LC_ALL: 'C', LANG: 'C' },
       },
     )
-    const line = stdout.trim()
-    const match = /^(\S{3}\s+\S{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$/.exec(line)
-    if (match === null) return null
-    const lstart = match[1] ?? ''
-    const command = (match[2] ?? '').trim()
-    if (lstart === '' || command === '') return null
-    return { lstart, command }
+    return parsePsIdentity(stdout)
   } catch {
     return null
   }

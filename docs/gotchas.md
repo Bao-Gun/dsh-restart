@@ -11,7 +11,7 @@
 - `/health` 200 ≠ 插件已加载：用错 profile / `DSH_HOME` 的 dsh web 照样 200 `/health`，但 `/dsh-restart/api/status` 是 404，界面上没有按钮 → helper 必须第二段探插件状态路由（200 才算成功），探不到就报「插件未加载」，不能报「已重启」。
 - 在真实 cordis ctx 上直接 `Reflect.get(ctx, 'connection')` 会抛 `cannot get property "connection" without inject`（测试里 mock 的 ctx 是普通对象，照不到这条规则，单测全绿也挡不住）→ cordis 对未声明 inject 的服务做了属性访问拦截，只能用 `ctx.get('connection')` → `connectionOf` 先 `ctx.get`，取不到再用反射兜底（src/index.ts:548-565）。
 - 冒烟克隆 profile 用 `cp -al`（硬链接）→ 副本与真实 profile 共享 inode，试跑里写日志、写 auth、写会话都会落到线上 profile → 必须写时复制克隆（macOS `cp -c`、Linux `--reflink=auto`，候选表见 `src/server/clone.ts`）；快路径失败只退回 `cp -R`（真复制），绝不退回 `cp -al`。
-- 冒烟起的 dsh 会把 sidecar 一起拉进同一个进程组，只按 pid 杀 → sidecar 变孤儿继续占端口，下一次冒烟直接假红 → 起子进程时 `detached` 建独立进程组，收尾用 `kill(-pid)` 打整个组（SIGTERM → 轮询 → SIGKILL），并轮询确认组里没人了才算清干净（src/server/smoke.ts:238-267）。
+- 冒烟起的 dsh 会把 sidecar 一起拉进同一个进程组，只按 pid 杀 → sidecar 变孤儿继续占端口，下一次冒烟直接假红 → 起子进程时 `detached` 建独立进程组，收尾用 `kill(-pid)` 打整个组（SIGTERM → 轮询 → SIGKILL），并轮询确认组里没人了才算清干净（src/server/smoke.ts:259-296）。
 - 往 profile 的 `cordis.patch.yml` 加顶层 `- id: restart-button` → 宿主只打印一条告警，不会新增条目，插件永远装不上 → 顶层 `- id:` 只能改已有条目，新增必须用 `- insert:` 块；`scripts/install.mjs` 的 `readPatchSnippet` 会强制校验片段以 `- insert:` 开头（install.mjs:59-66）。
 - 客户端插件产物写成 esm 或忘了包一行自注册 → 宿主不加载、也不报错，按钮永远不出现，单测和构建都绿 → 客户端必须是 classic script 且自带 `window.__ModuleLoader__.load({ id, factory })`；tsup 客户端那份用 iife + banner/footer 把模块体包进 factory，保证首行自注册、副作用延迟到 materialize（tsup.config.ts:26-42）。
 - 插件模块解析不到（没装、软链断、产物缺）→ dsh web 仍能启动，只是 stderr 里一句 `1 entry did not activate`，侧栏少一颗按钮 → 失败模式是「按钮静默消失」，不是「起不来」；所以装完先看这一行，预检失败的文案也要讲明白是插件没加载（见上方 /health 那条）。
@@ -27,7 +27,7 @@
 
 - 主按钮文字写死 `#fff` → 暗色皮肤下 `--dsw-alias-button-primary-fill` 是接近白的 `rgb(249,250,251)`，白字白底，按钮上的「重启」看不见 → 主题把「深底白字」和「白底深字」两套都换成了 CSS 变量，文字必须用 `var(--dsw-alias-label-primary-foreground)`，别写死颜色（`src/client/dialog.css.ts`）。
 - 以为 `DSH_DAEMON_OPEN_BROWSER=0` 能让 daemon 别开浏览器 → `~/.dsh/daemon/watchdog.js:227` 是 `const OPEN_BROWSER = 1;`，这个环境变量压根没接，唯一的闸口是 `watchdog.js:793` 的 `else if (process.env.SSH_CONNECTION || process.env.SSH_TTY)`，而那是个生成文件、`dsh_daemon_reinstall` 会覆盖 → 在 helper 里派生 daemon 时自己塞 `DSH_DAEMON_OPEN_BROWSER=0` 和一条假 `SSH_CONNECTION`（`src/server/restart.ts` 的 `daemonRestartEnv`），页面交给弹窗自己刷新。
-- 用 `ps -o lstart=` 取进程启动时间做身份比对 → 中文 locale（`LANG=zh_CN.UTF-8`）下 macOS 打成 `一 11/23 22:40:14 2026`，与英文月份正则对不上，所有 pid 身份都变成「无法确认」，陈旧试跑的清扫因此不再发信号，孤儿实例带着端口一直活着 → 调 `ps` 时钉住 `LC_ALL=C`、`LANG=C`（`src/server/smoke.ts` 的 `probeProcessIdentity`）。
+- 用 `ps -o lstart=` 取进程启动时间做身份比对 → 中文 locale（`LANG=zh_CN.UTF-8`）下 macOS 打成 `一 11/23 22:40:14 2026`，与英文月份正则对不上，所有 pid 身份都变成「无法确认」，陈旧试跑的清扫因此不再发信号，孤儿实例带着端口一直活着 → 调 `ps` 时钉住 `LC_ALL=C`、`LANG=C`，解析只走 `parsePsIdentity`（`src/server/smoke.ts`，`test/smoke.test.ts` 钉住 macOS / Linux / zh_CN 三种样本）。
 
 
 - 弹窗里两颗按钮（「开始检查」+「重启」）→ 用户想重启得先点检查、再点重启，多一步；更糟的是勾选框当时只在「本轮判红」时才出现，等于「想强制重启，必须先失败一次」 → 收敛成一颗「重启」：点它默认就是先预检后重启，勾上「跳过检查」等价于旧的强制重启（`src/client/dialog.ts`）。预检按钮删掉后，「上次通过」不能当本轮通过，指纹过期照样重跑（`src/client/dialog.ts` 的 `renderStatus`）。
