@@ -1,3 +1,6 @@
+import { spawnSync } from 'node:child_process'
+import { mkdtemp, rm, symlink } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -99,7 +102,7 @@ describe('verifyIndex', () => {
     expect(codesOf(result)).toEqual(expect.arrayContaining(['version-mismatch', 'missing-artifacts']))
   })
 
-  it('逐个检查安装器要求的产物（不是只查入口那一个）', async () => {
+  it('逐个检查安装器要求的三个产物（少一个就红）', async () => {
     const { verifyIndex } = await loadCheckIndex()
     const seen: string[] = []
     verifyIndex(makeIndex(), {
@@ -110,7 +113,8 @@ describe('verifyIndex', () => {
         return true
       },
     })
-    expect(seen).toEqual(expect.arrayContaining(['lib/index.js', 'lib/client.js']))
+    // 三个都钉住：从 REQUIRED_ARTIFACTS 里删掉 lib/helper.js 会让这条红。
+    expect([...new Set(seen)].sort()).toEqual(['lib/client.js', 'lib/helper.js', 'lib/index.js'])
   })
 
   it.each([
@@ -136,6 +140,19 @@ describe('verifyIndex', () => {
       commitHasArtifacts: () => true,
     })
     expect(result).toEqual({ ok: true })
+  })
+
+  it('经软链入口调用时也真的执行（入口判重不能 fail-open）', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-restart-index-link-'))
+    try {
+      const link = join(dir, 'check-index.mjs')
+      await symlink(join(repoRoot, 'scripts', 'check-index.mjs'), link)
+      const result = spawnSync(process.execPath, [link], { cwd: repoRoot, encoding: 'utf8', timeout: 20000 })
+      // 红或绿都算执行过：这里只钉「有输出」，不钉当前索引的状态（Task 4 会把它翻绿）。
+      expect(`${result.stdout}${result.stderr}`).toMatch(/\[missing-artifacts\]|索引自检通过/)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 
   it('没有 plugins 数组 → invalid-index（而不是静默通过）', async () => {

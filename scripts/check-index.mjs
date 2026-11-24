@@ -14,7 +14,7 @@
  * 只使用 node: 内置模块，不引入第三方依赖，也不参与 tsc。
  */
 import { execFileSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { readFileSync, realpathSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -92,25 +92,48 @@ export function verifyIndex(index, { packageVersion, commitHasArtifacts }) {
   return errors.length === 0 ? { ok: true } : { ok: false, errors }
 }
 
-function gitOk(args) {
+function gitOk(args, cwd) {
   try {
-    execFileSync('git', args, { cwd: REPO_DIR, stdio: 'ignore' })
+    execFileSync('git', args, { cwd, stdio: 'ignore' })
     return true
   } catch {
     return false
   }
 }
 
-/** 产物「在」还不够：内容必须和当前提交一致，否则索引指的就是旧产物。 */
-export function commitHasArtifacts(commit, path) {
-  if (!gitOk(['cat-file', '-e', `${commit}:${path}`])) return false
-  return gitOk(['diff', '--quiet', `${commit}:${path}`, `HEAD:${path}`])
+/**
+ * 产物「在」还不够：内容必须和当前提交一致，否则索引指的就是旧产物。
+ * cwd 只给测试指向临时仓库用，默认就是本仓库。
+ */
+export function commitHasArtifacts(commit, path, { cwd = REPO_DIR } = {}) {
+  if (!gitOk(['cat-file', '-e', `${commit}:${path}`], cwd)) return false
+  return gitOk(['diff', '--quiet', `${commit}:${path}`, `HEAD:${path}`], cwd)
 }
 
-export function run({ out = console.log, err = console.error } = {}) {
-  const pkg = JSON.parse(readFileSync(join(REPO_DIR, 'package.json'), 'utf8'))
-  const index = JSON.parse(readFileSync(join(REPO_DIR, 'site', 'index.json'), 'utf8'))
-  const result = verifyIndex(index, { packageVersion: pkg.version, commitHasArtifacts })
+/** 读不出来时点名是哪个文件：这不是索引内容的问题，别给发版指引。 */
+function readJson(path) {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'))
+  } catch (error) {
+    throw new Error(`索引自检读不出来：${path}（${error instanceof Error ? error.message : String(error)}）`)
+  }
+}
+
+export function run({ repoDir = REPO_DIR, out = console.log, err = console.error } = {}) {
+  let pkg
+  let index
+  try {
+    pkg = readJson(join(repoDir, 'package.json'))
+    index = readJson(join(repoDir, 'site', 'index.json'))
+  } catch (error) {
+    // 读不出来是「没法开始」，不是索引内容的问题：只说清哪个文件，别给发版指引。
+    err(`✗ ${error instanceof Error ? error.message : String(error)}`)
+    return 1
+  }
+  const result = verifyIndex(index, {
+    packageVersion: pkg.version,
+    commitHasArtifacts: (commit, path) => commitHasArtifacts(commit, path, { cwd: repoDir }),
+  })
 
   if (result.ok) {
     const entries = index.plugins.flatMap((plugin) =>
@@ -125,13 +148,22 @@ export function run({ out = console.log, err = console.error } = {}) {
   return 1
 }
 
-const invokedDirectly = process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
-if (invokedDirectly) {
+function realpathOrNull(path) {
+  try {
+    return realpathSync(path)
+  } catch {
+    return null
+  }
+}
+
+// 两边都取 realpath：脚本经软链调用时，原地字符串比较会静默不执行，⑥ 就退化成了空检查。
+const scriptPath = realpathOrNull(fileURLToPath(import.meta.url))
+const argvPath = process.argv[1] === undefined ? null : realpathOrNull(resolve(process.argv[1]))
+if (scriptPath !== null && argvPath === scriptPath) {
   try {
     process.exitCode = run()
   } catch (error) {
-    console.error(`✗ 索引自检没法开始：${error instanceof Error ? error.message : String(error)}`)
-    console.error(GUIDANCE)
+    console.error(`✗ ${error instanceof Error ? error.message : String(error)}`)
     process.exitCode = 1
   }
 }
