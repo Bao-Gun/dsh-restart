@@ -5,7 +5,9 @@
  * 宿主没有为「往这个菜单里加行」开插槽。所以按实机 DOM 结构补挂，
  * 并且只在「看起来是账号菜单」的 `[role="menu"]` 上动手：
  * - 菜单是 portal 到 `document.body` 的 `<div role="menu">`，每次打开都是新节点；
- * - 每行是 `<div class="_itemWrap_…">` 包一个 `<button role="menuitem">`；
+ * - 行是 `<button role="menuitem">`：有时外面包一层 `<div class="_itemWrap_…">`，
+ *   有时所有行直接挂在菜单根或 `_viewport_` 下。两种都得能插，且外壳的 class 只在
+ *   「那一层只包一行」时才抄——抄到菜单根/viewport 的定位 class 会变成浮层（issue #1）；
  * - 弹层关掉时整棵节点被移除，所以必须用 MutationObserver 在每次重开时补挂。
  *
  * 只往菜单里插，**不**在侧栏底部另起一行：实机上那样会和「更多」并排成两行，
@@ -149,13 +151,16 @@ function injectIntoMenu(doc: Document, onOpen: () => void): boolean {
     const items = menuitemsOf(menu)
     const last = items[items.length - 1]
     if (last === undefined) continue
-    const wrapper = last.parentElement
-    const row = buildMenuRow(doc, last, onOpen)
-    if (wrapper !== null && wrapper !== menu) {
-      wrapper.parentElement?.insertBefore(row, wrapper)
-    } else {
-      last.parentElement?.insertBefore(row, last)
-    }
+    const shell = last.parentElement
+    if (shell === null) continue
+    // 只在「这一层只包一行」时才抄它的 class。行的外壳可能是 _itemWrap_（一行一个），
+    // 也可能根本没有、所有行直接挂在菜单根或 viewport 下（issue #1 的实机结构）：
+    // 那时抄到的就是菜单根的 _list_/_portal_，position:absolute/fixed 一带，注入行
+    // 立刻变成浮层压住菜单头几行。插入点也固定在最后一行所在的那一层，别跨层。
+    const perRowShell = shell !== menu && menuitemsOf(shell).length === 1
+    const row = buildMenuRow(doc, last, onOpen, perRowShell)
+    if (perRowShell && shell.parentElement !== null) shell.parentElement.insertBefore(row, shell)
+    else shell.insertBefore(row, last)
     return true
   }
   return false
@@ -180,10 +185,15 @@ function menuitemsOf(menu: Element): HTMLButtonElement[] {
 }
 
 /** 抄相邻行的 class：外面一层 itemWrap、按钮本体、图标、文字各一份。 */
-function buildMenuRow(doc: Document, source: HTMLButtonElement, onOpen: () => void): Element {
+function buildMenuRow(
+  doc: Document,
+  source: HTMLButtonElement,
+  onOpen: () => void,
+  copyShellClass: boolean,
+): Element {
   const wrapper = doc.createElement('div')
   wrapper.setAttribute(WRAP_ATTR, '1')
-  const wrapClass = source.parentElement?.className ?? ''
+  const wrapClass = copyShellClass ? (source.parentElement?.className ?? '') : ''
   if (wrapClass !== '') wrapper.className = wrapClass
 
   const button = doc.createElement('button')

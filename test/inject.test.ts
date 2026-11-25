@@ -140,6 +140,75 @@ describe('injectMenuRow：插在账号菜单倒数第二行', () => {
   })
 })
 
+/** 旧结构（issue #1 实机）：menuitem 直接挂在 role="menu" 根节点下，没有 viewport，也没有逐行的 itemWrap。 */
+function flatItem(label: string): string {
+  return (
+    '<button type="button" role="menuitem" class="' + ITEM + '">' +
+    '<span aria-hidden="true" class="' + ITEM_ICON + '"></span>' +
+    '<span class="' + ITEM_LABEL + '">' + label + '</span>' +
+    '</button>'
+  )
+}
+
+function flatAccountMenu(): string {
+  return (
+    '<div role="menu" class="_list_70kcw_7 _portal_70kcw_43" data-anchor-side="top">' +
+    flatItem('设置') + flatItem('联系我们') + flatItem('退出登录') +
+    '</div>'
+  )
+}
+
+describe('injectMenuRow：menuitem 直接挂在菜单根下（issue #1）', () => {
+  // 实机那次：「重启」行抄了菜单根的 class（_list_ 带 position:absolute、_portal_ 带
+  // position:fixed），注入行成了浮层，压住菜单最上面两行；插入点也跑到了根节点外面。
+  // 判据不是「抄哪个 class」，而是「不抄容器的定位 class，并且留在同一层」。
+  beforeEach(() => {
+    document.body.innerHTML = flatAccountMenu()
+  })
+
+  afterEach(() => {
+    document.body.innerHTML = ''
+  })
+
+  it('不复制菜单根的 class，注入行不会变成浮层', () => {
+    const dispose = injectMenuRow(document, { onOpen: () => undefined })
+    try {
+      const menu = document.querySelector('[role="menu"]')
+      const wrap = rows(document)[0]?.parentElement
+      expect(menu?.className).toContain('_list_70kcw_7')
+      expect(wrap?.className).toBe('')
+      expect(wrap?.parentElement).toBe(menu)
+    } finally {
+      dispose()
+    }
+  })
+
+  it('仍然插在「退出登录」前面，成为菜单里的倒数第二行', () => {
+    const dispose = injectMenuRow(document, { onOpen: () => undefined })
+    try {
+      const items = Array.from(document.querySelectorAll('[role="menu"] button[role="menuitem"]'))
+      expect(items).toHaveLength(4)
+      expect(items[2]?.hasAttribute('data-dsh-restart-row')).toBe(true)
+      expect(items[2]?.textContent).toBe('重启')
+      expect(items[3]?.textContent).toContain('退出登录')
+    } finally {
+      dispose()
+    }
+  })
+
+  it('菜单重开后补挂，也不会带回菜单根的 class', async () => {
+    const dispose = injectMenuRow(document, { onOpen: () => undefined, debounceMs: 5 })
+    try {
+      document.body.innerHTML = flatAccountMenu()
+      await wait(60)
+      expect(rows(document)).toHaveLength(1)
+      expect(rows(document)[0]?.parentElement?.className).toBe('')
+    } finally {
+      dispose()
+    }
+  })
+})
+
 describe('injectMenuRow：没有菜单时什么都不插', () => {
   beforeEach(() => {
     document.body.innerHTML = fallbackOnly()

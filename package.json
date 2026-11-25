@@ -1,6 +1,6 @@
 {
   "name": "dsh-restart",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "description": "给 dsh web 加「重启 + 重启前预检」按钮的 DSH 插件",
