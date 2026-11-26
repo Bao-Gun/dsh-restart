@@ -8,7 +8,8 @@
  * - 行是 `<button role="menuitem">`：有时外面包一层 `<div class="_itemWrap_…">`，
  *   有时所有行直接挂在菜单根或 `_viewport_` 下。两种都得能插，且外壳的 class 只在
  *   「那一层只包一行」时才抄——抄到菜单根/viewport 的定位 class 会变成浮层（issue #1）；
- * - 弹层关掉时整棵节点被移除，所以必须用 MutationObserver 在每次重开时补挂。
+ * - 弹层关掉时整棵节点被移除，所以必须用 MutationObserver 在每次重开时补挂；
+ * - 账号菜单靠「某一行整行等于 设置 / 退出登录」认，不按子串（issue #2）。
  *
  * 只往菜单里插，**不**在侧栏底部另起一行：实机上那样会和「更多」并排成两行，
  * 把「更多」挤走（2026-11-23 现场反馈）。菜单没开就没入口，这是可以接受的代价。
@@ -28,7 +29,32 @@ export const MENU_ROW_LABEL = '重启'
 
 const ROW_ATTR = 'data-dsh-restart-row'
 const WRAP_ATTR = 'data-dsh-restart-wrap'
-const ACCOUNT_MENU_LABEL = /设置|Settings|联系|Contact|退出|Sign out|登录|Sign in/
+/**
+ * 账号菜单里认得的整行文案：只认**整行相等**，不认子串（issue #2）。
+ *
+ * 按子串判会把宿主里别的菜单一起认进来：DS Bot 分组标题旁的「+」菜单会把所有群名、
+ * Bot 名铺成菜单行，群里有个名字带「用户登录」四个字整张菜单就被当成账号菜单。
+ */
+const ACCOUNT_MENU_ROWS: ReadonlySet<string> = new Set([
+  '设置',
+  'Settings',
+  '联系我们',
+  '联系',
+  'Contact',
+  'Contact us',
+  '意见反馈',
+  'Feedback',
+  '退出登录',
+  '退出',
+  'Sign out',
+  'Log out',
+  '登录',
+  'Sign in',
+])
+/** 分组标题旁「+」那类建/加菜单：永远不是账号菜单（issue #2）。 */
+const NON_ACCOUNT_MENU_CLASS = 'bt-sec-add-menu'
+/** 建 Bot / 建群 / 添加已有对话：见到这种行就肯定不是账号菜单。 */
+const BUILDER_ROW = /^(新建|添加已有对话)/
 
 export interface InjectMenuRowOptions {
   /** 点击自建行时打开弹窗。 */
@@ -166,13 +192,17 @@ function injectIntoMenu(doc: Document, onOpen: () => void): boolean {
   return false
 }
 
-/** 只认账号菜单：排除右键/下拉菜单，并要求标签里出现「设置 / 退出」这类词。 */
+/** 只认账号菜单：排除右键/下拉菜单，并要求某一行整行等于「设置 / 退出登录」这类文案。 */
 function looksLikeAccountMenu(menu: Element): boolean {
   if (menu.hasAttribute('data-context-menu')) return false
+  // 宿主自己给「+」菜单打了类名，认得就先用它挡一道。
+  if (menu.closest('.' + NON_ACCOUNT_MENU_CLASS) !== null) return false
   const items = menuitemsOf(menu)
   if (items.length < 2) return false
-  const labels = items.map((item) => item.textContent ?? '').join(' ')
-  return ACCOUNT_MENU_LABEL.test(labels)
+  const labels = items.map((item) => (item.textContent ?? '').replace(/\s+/g, ' ').trim())
+  // 建群那类菜单会把所有群名铺成行，某个群正好叫「设置」也不奇怪：看到建/加行就不用再看了。
+  if (labels.some((label) => BUILDER_ROW.test(label))) return false
+  return labels.some((label) => ACCOUNT_MENU_ROWS.has(label))
 }
 
 function menuitemsOf(menu: Element): HTMLButtonElement[] {

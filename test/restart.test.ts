@@ -752,16 +752,19 @@ describe('helperMain', () => {
   })
 })
 
-describe('daemonRestartEnv：重启完别自己弹新标签页', () => {
-  it('默认带上 DSH_DAEMON_OPEN_BROWSER=0，并给 watchdog 一个非空 SSH_CONNECTION', () => {
+describe('daemonRestartEnv：交给 daemon 的环境', () => {
+  // issue #4：以前为了让 watchdog 别弹浏览器，这里塞过一条假 SSH_CONNECTION。
+  // 它会留在 daemon 拉起（并重新 exec）的 dsh web 进程 env 里，DSH 于是把自己当
+  // 远程会话：launchedThroughSsh() 为真，/open-in-app/apps 直接返回空表。
+  it('带上 DSH_DAEMON_OPEN_BROWSER=0，但不伪造 SSH 会话', () => {
     const env = daemonRestartEnv({ PATH: '/bin' })
     expect(env.PATH).toBe('/bin')
     expect(env.DSH_DAEMON_OPEN_BROWSER).toBe('0')
-    // watchdog.js:793 只做真值判断，空串等于没设。
-    expect(env.SSH_CONNECTION).toBeTruthy()
+    expect(env.SSH_CONNECTION).toBeUndefined()
+    expect(env.SSH_TTY).toBeUndefined()
   })
 
-  it('真 SSH 会话里已有的 SSH_CONNECTION 不被覆盖', () => {
+  it('真 SSH 会话里已有的 SSH_CONNECTION 原样带过去', () => {
     const env = daemonRestartEnv({ SSH_CONNECTION: '10.0.0.1 5000 10.0.0.2 22' })
     expect(env.SSH_CONNECTION).toBe('10.0.0.1 5000 10.0.0.2 22')
   })

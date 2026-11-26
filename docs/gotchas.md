@@ -26,7 +26,7 @@
 - `dsh_restart` 里先 `concludeTurn()` 再 `issueRestartLater(...)` 排延迟派生 → 本轮可能立刻收尾，helper 还没排上，重启就丢了；反过来先派生再结束本轮，工具结果也来得及落盘 → 顺序必须是先 `issueRestartLater`、后 `concludeTurn`（`src/tools/restart.ts`）；2.5 秒延迟就是给落盘留的时间，helper 一启动就可能掐掉本进程。
 
 - 主按钮文字写死 `#fff` → 暗色皮肤下 `--dsw-alias-button-primary-fill` 是接近白的 `rgb(249,250,251)`，白字白底，按钮上的「重启」看不见 → 主题把「深底白字」和「白底深字」两套都换成了 CSS 变量，文字必须用 `var(--dsw-alias-label-primary-foreground)`，别写死颜色（`src/client/dialog.css.ts`）。
-- 以为 `DSH_DAEMON_OPEN_BROWSER=0` 能让 daemon 别开浏览器 → `~/.dsh/daemon/watchdog.js:227` 是 `const OPEN_BROWSER = 1;`，这个环境变量压根没接，唯一的闸口是 `watchdog.js:793` 的 `else if (process.env.SSH_CONNECTION || process.env.SSH_TTY)`，而那是个生成文件、`dsh_daemon_reinstall` 会覆盖 → 在 helper 里派生 daemon 时自己塞 `DSH_DAEMON_OPEN_BROWSER=0` 和一条假 `SSH_CONNECTION`（`src/server/restart.ts` 的 `daemonRestartEnv`），页面交给弹窗自己刷新。
+- 以为 `DSH_DAEMON_OPEN_BROWSER=0` 能让 daemon 别开浏览器 → `~/.dsh/daemon/watchdog.js:227` 是 `const OPEN_BROWSER = 1;`，这个环境变量压根没接，唯一的闸口是 `watchdog.js:793` 的 `else if (process.env.SSH_CONNECTION || process.env.SSH_TTY)`，而那是个生成文件、`dsh_daemon_reinstall` 会覆盖 → 当时在 helper 里派生 daemon 时自己塞 `DSH_DAEMON_OPEN_BROWSER=0` 和一条假 `SSH_CONNECTION`（`src/server/restart.ts` 的 `daemonRestartEnv`）；**issue #4 推翻了这条**：假 `SSH_CONNECTION` 会跟着 daemon 重新 exec 进 dsh web 的 env，DSH 的 `launchedThroughSsh()` 只判非空，重启出的实例被当成远程会话，`/open-in-app/apps` 直接返回空表（手工起同一个 profile 则正常）→ 现在只留 `DSH_DAEMON_OPEN_BROWSER=0`，旧 daemon 上多开一个标签页是可接受代价。
 - 用 `ps -o lstart=` 取进程启动时间做身份比对 → 中文 locale（`LANG=zh_CN.UTF-8`）下 macOS 打成 `一 11/23 22:40:14 2026`，与英文月份正则对不上，所有 pid 身份都变成「无法确认」，陈旧试跑的清扫因此不再发信号，孤儿实例带着端口一直活着 → 调 `ps` 时钉住 `LC_ALL=C`、`LANG=C`，解析只走 `parsePsIdentity`（`src/server/smoke.ts`，`test/smoke.test.ts` 钉住 macOS / Linux / zh_CN 三种样本）。
 
 
@@ -45,3 +45,4 @@
 - Pages 部署报 `Found 0 artifact(s)` / `No artifacts named "github-pages" were found` → upload 与 deploy 之间的竞态，不是配置错 → `gh run rerun <run-id> --failed` 一次即好，别改 workflow（本仓与 `dsh-plugins` 各踩过一次）。
 - 菜单行的外壳 class 直接抄 `source.parentElement.className`（issue #1）→ 实机那一版 menuitem 直接挂在 `role="menu"` 根节点下，抄到的是菜单根的 `_list_…`（`position:absolute`）和 `_portal_…`（`position:fixed`），注入的「重启」行变成浮层压住菜单头两行，插入点还跑到了根节点外面 → 外壳 class 只在「那一层只包一行」（`shell !== menu && shell` 里 menuitem 恰好 1 个）时才抄，插入点固定在最后一行所在的那一层；`test/inject.test.ts` 同时钉住「有 viewport/itemWrap」与「行直接挂在菜单根」两种结构（`src/client/inject.ts` 的 `injectIntoMenu`、`buildMenuRow`）。
 
+- 账号菜单判定把整张菜单的文案拼成字符串再按子串 `test(/设置|联系|退出|登录/)`（issue #2）→ DS Bot 分组标题旁的「+」菜单（`bt-sec-add-menu`：新建 Bot / 新建群聊 / 添加已有对话，后面把所有 Bot 与群名平铺成 menuitem）里正好有个群叫「用户登录提醒群」，命中「登录」后整张菜单被当成账号菜单，「重启」被插到末行之前，点它还会弹重启确认 → 判定改成**某一行整行相等**才算（`设置 / 联系我们 / 退出登录 / Sign out …`），并且见到「新建 / 添加已有对话」这种建群行、或菜单挂在 `.bt-sec-add-menu` 下就一律排除；群名整行恰好叫「设置」也不会误判（`src/client/inject.ts` 的 `looksLikeAccountMenu`，`test/inject.test.ts` 用两张菜单各自的 DOM 钉住）。

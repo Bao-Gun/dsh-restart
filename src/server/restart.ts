@@ -389,21 +389,20 @@ function acquireLock(lockPath: string, write: (message: string) => void): boolea
 }
 
 /**
- * 交给 `dsh-daemon restart` 的 env。
+ * 交给 `dsh-daemon restart` 的 env：只带一条 `DSH_DAEMON_OPEN_BROWSER=0`。
  *
- * 重启完自己弹一个新标签页的是 daemon，不是 dsh web：它给 dsh 传了 --no-open
- * （~/.dsh/daemon/watchdog.js:655），但自己那份 `OPEN_BROWSER` 在本机这版里硬编码成 1
- * （watchdog.js:227），并不读 DSH_DAEMON_OPEN_BROWSER（:791 的日志文案写了那个变量名，
- * 实际没接）。外部唯一能影响的分支是 :793 的 SSH_CONNECTION / SSH_TTY —— 所以这里塞一个
- * 非空值，让它走「远程会话不弹浏览器、自己开」那一支；DSH_DAEMON_OPEN_BROWSER=0 顺手带上，
- * 等 daemon 真接上这个变量就自动生效。
+ * 重启完自己弹一个新标签页的是 daemon，不是 dsh web（它给 dsh 传了 --no-open），页面由
+ * 我们的弹窗刷新（2026-11-23 反馈：要的是刷新当前页，不是再来一个标签页）。
  *
- * 用户要的是「刷新当前页」，不是「再来一个标签页」（2026-11-23 反馈）。
+ * 早先为了让老 daemon 别弹浏览器，这里还塞过一条假 `SSH_CONNECTION`
+ * （`~/.dsh/daemon/watchdog.js` 那版把 OPEN_BROWSER 写死成 1，唯一闸口是 SSH 分支）。
+ * 但那条哨兵会留在 daemon 拉起——并在 restart 时重新 exec——的 dsh web 进程 env 里：
+ * DSH 的 `launchedThroughSsh()` 只判非空，于是整个实例被当成远程会话，
+ * `/open-in-app/apps` 直接返回空表（issue #4）。功能正确性优先：老 daemon 上宁可多开
+ * 一个标签页，也不能让重启出来的实例残废。真 SSH 会话里继承来的变量原样带过去，不动。
  */
 export function daemonRestartEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...base, DSH_DAEMON_OPEN_BROWSER: '0' }
-  if (!env.SSH_CONNECTION && !env.SSH_TTY) env.SSH_CONNECTION = 'dsh-restart 0 dsh-restart 0'
-  return env
+  return { ...base, DSH_DAEMON_OPEN_BROWSER: '0' }
 }
 
 function defaultStartDaemonRestart(logFd: number): DaemonRestartHandle {

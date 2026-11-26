@@ -939,3 +939,77 @@ describe('mountDialog：五段与状态', () => {
     expect(textOf('[data-dsh-restart-stage="boot"]')).toContain('通过')
   })
 })
+
+  describe('injectMenuRow：分组「+」菜单不是账号菜单（issue #2）', () => {
+    // 宿主侧两个菜单长得一样：<div role="menu"> + 一排 button[role="menuitem"]。
+    // 以前把整张菜单的文案拼成字符串再 test() 子串，DS Bot 分组标题旁的「+」菜单
+    // 会把所有群名铺成菜单行，群里有个名字带「用户登录」就整张菜单被当成账号菜单。
+    function plusMenu(labels: string[]): string {
+      return (
+        '<div role="menu" class="bt-sec-add-menu">' +
+        ['新建 Bot', '新建群聊', '添加已有对话'].concat(labels).map((label) => menuItem(label)).join('') +
+        '</div>'
+      )
+    }
+
+    function plainMenu(labels: string[]): string {
+      return '<div role="menu">' + labels.map((label) => menuItem(label)).join('') + '</div>'
+    }
+
+    beforeEach(() => {
+      document.body.innerHTML = fallbackOnly()
+    })
+
+    afterEach(() => {
+      document.body.innerHTML = ''
+    })
+
+    it('群名里带「用户登录」四个字，也不往里插「重启」', async () => {
+      document.body.innerHTML = fallbackOnly() + plusMenu(['用户登录提醒群', '产品群'])
+      const dispose = injectMenuRow(document, { onOpen: () => undefined, debounceMs: 5 })
+      try {
+        await wait(40)
+        expect(rows(document)).toHaveLength(0)
+        expect(
+          Array.from(document.querySelectorAll('[role="menu"] button[role="menuitem"]')).some(
+            (item) => item.textContent === '重启',
+          ),
+        ).toBe(false)
+      } finally {
+        dispose()
+      }
+    })
+
+    it('群名整行等于「设置」也不误判：有「新建 / 添加已有对话」行就不是账号菜单', async () => {
+      document.body.innerHTML = fallbackOnly() + plusMenu(['设置', '退出登录'])
+      const dispose = injectMenuRow(document, { onOpen: () => undefined, debounceMs: 5 })
+      try {
+        await wait(40)
+        expect(rows(document)).toHaveLength(0)
+      } finally {
+        dispose()
+      }
+    })
+
+    it('普通菜单里出现「设置」「登录」这类字样，也不再按子串命中', async () => {
+      document.body.innerHTML = fallbackOnly() + plainMenu(['团队设置指南', '昨日登录提醒', '关于本群'])
+      const dispose = injectMenuRow(document, { onOpen: () => undefined, debounceMs: 5 })
+      try {
+        await wait(40)
+        expect(rows(document)).toHaveLength(0)
+      } finally {
+        dispose()
+      }
+    })
+
+    it('账号菜单照旧能认出来（整行相等）', async () => {
+      document.body.innerHTML = fallbackOnly() + accountMenu()
+      const dispose = injectMenuRow(document, { onOpen: () => undefined, debounceMs: 5 })
+      try {
+        await wait(40)
+        expect(rows(document)).toHaveLength(1)
+      } finally {
+        dispose()
+      }
+    })
+  })

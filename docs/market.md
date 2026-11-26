@@ -25,7 +25,7 @@ pnpm market:index && node scripts/check-index.mjs
 git add site/index.json && git commit -m "chore: 更新索引" && git push
 ```
 
-`scripts/check-index.mjs` 是 `check.sh` ⑥ 用的同一个检查，单独跑它是因为它才是「发出去的东西能不能装」的判据：**索引里那个 commit 必须真的带 `lib/index.js`、`lib/client.js`、`lib/helper.js`，而且必须和 HEAD 里的逐字节一致**。少了这一步的典型翻车是「版本号改了、产物没进提交」——索引指向的提交里没有产物（装下来起不来），或者指向旧提交（装下来还是老版本），本地 `pnpm build` 一切正常，线上才炸。这份逐字节比对也管 `src/client/` 的改动：只动了客户端注入，`lib/client.js` 没重建进提交，一样判红。
+`scripts/check-index.mjs` 是 `check.sh` ⑥ 用的同一个检查，单独跑它是因为它才是「发出去的东西能不能装」的判据：**索引里那个 commit 必须真的带 `lib/index.js`、`lib/client.js`、`lib/helper.js`，而且必须和 HEAD 里的逐字节一致**。少了这一步的典型翻车是「版本号改了、产物没进提交」——索引指向的提交里没有产物（装下来起不来），或者指向旧提交（装下来还是老版本），本地 `pnpm build` 一切正常，线上才炸。这份逐字节比对也管 `src/client/` 的改动：只动了客户端注入，`lib/client.js` 没重建进提交，一样判红。一次改动同时落在客户端与服务端时（例如 0.2.2 的 issue #2 + #4），提交前对着 `git status` 确认 `lib/client.js` 和 `lib/helper.js` 都在里面——漏掉一个，装下来就是「一个 bug 修了、另一个还在」，而索引自检照样绿（它只认产物与 HEAD 一致，不认功能对不对）。
 
 推上去之后 Actions 会重跑一次生成再部署，所以第 4 步的本地提交只是为了仓库自洽，不是必需。
 
